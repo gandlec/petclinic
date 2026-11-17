@@ -43,6 +43,27 @@ display:none;
   display: flex;
   align-items: center;
   gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 16px;
+}
+
+.sort-header {
+  border: 0;
+  padding: 0;
+  background: transparent;
+  font-weight: inherit;
+}
+
+th[aria-sort="none"] .sort-header::after {
+  content: " ⇅";
+}
+
+th[aria-sort="ascending"] .sort-header::after {
+  content: " ▲";
+}
+
+th[aria-sort="descending"] .sort-header::after {
+  content: " ▼";
 }
 
 .owners-page-size {

@@ -2,9 +2,10 @@
 
 import { ComponentFixture, TestBed, waitForAsync } from '@angular/core/testing';
 import {CUSTOM_ELEMENTS_SCHEMA} from '@angular/core';
+import {By} from '@angular/platform-browser';
 
 import {VisitAddComponent} from './visit-add.component';
-import {FormsModule} from '@angular/forms';
+import {FormsModule, NgModel} from '@angular/forms';
 import {VisitService} from '../visit.service';
 import {PetService} from '../../pets/pet.service';
 import {ActivatedRoute, Router} from '@angular/router';
@@ -12,10 +13,11 @@ import {ActivatedRouteStub, RouterStub} from '../../testing/router-stubs';
 import {Pet} from '../../pets/pet';
 import {Observable, of} from 'rxjs';
 import {MatMomentDateModule} from '@angular/material-moment-adapter';
-import { MatDatepickerModule } from '@angular/material/datepicker';
+import {MatDatepickerInput, MatDatepickerModule} from '@angular/material/datepicker';
 import Spy = jasmine.Spy;
 import {OwnerService} from '../../owners/owner.service';
 import {Owner} from '../../owners/owner';
+import * as moment from 'moment';
 
 class PetServiceStub {
   addPet(pet: Pet): Observable<Pet> {
@@ -86,6 +88,7 @@ describe('VisitAddComponent', () => {
     };
     petService = fixture.debugElement.injector.get(PetService);
     visitService = fixture.debugElement.injector.get(VisitService);
+    spyOn(petService, 'getPetById').and.returnValue(of(testPet));
     spy = spyOn(petService, 'addPet')
       .and.returnValue(of(testPet));
 
@@ -106,6 +109,22 @@ describe('VisitAddComponent', () => {
     expect(visit.id).toBeNull();
     expect(component.addedSuccess).toBeTrue();
     expect(router.navigate).toHaveBeenCalledWith(['/owners', 1]);
+  });
+
+  it('should limit visit dates to the pet birth date and one year ahead', () => {
+    expect(component.minVisitDate.format('YYYY-MM-DD')).toBe(testPet.birthDate);
+    expect(component.maxVisitDate.format('YYYY-MM-DD')).toBe(moment().add(1, 'year').format('YYYY-MM-DD'));
+    expect(component.dateLimitsLoaded).toBeTrue();
+
+    const dateElement = fixture.debugElement.query(By.css('input[name="date"]'));
+    const datepickerInput = dateElement.injector.get(MatDatepickerInput);
+    const dateControl = dateElement.injector.get(NgModel).control;
+    dateControl.setValue(moment(testPet.birthDate).subtract(1, 'day'));
+    expect(datepickerInput.validate(dateControl))
+      .toEqual(jasmine.objectContaining({matDatepickerMin: jasmine.anything()}));
+    dateControl.setValue(moment().add(1, 'year').add(1, 'day'));
+    expect(datepickerInput.validate(dateControl))
+      .toEqual(jasmine.objectContaining({matDatepickerMax: jasmine.anything()}));
   });
 
   it('should navigate to owner detail via gotoOwnerDetail', () => {

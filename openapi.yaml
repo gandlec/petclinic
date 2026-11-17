@@ -192,7 +192,7 @@ paths:
       operationId: listOwners
       parameters:
       - in: query
-        name: lastName
+        name: search
         required: false
         schema:
           type: string
@@ -315,6 +315,70 @@ paths:
                 $ref: "#/components/schemas/ProblemDetail"
           description: Internal Server Error
       summary: Count owners
+      tags:
+      - owner-rest-controller
+  /api/owners/page:
+    get:
+      operationId: listOwnersPage
+      parameters:
+      - in: query
+        name: search
+        required: false
+        schema:
+          type: string
+          default: ""
+      - in: query
+        name: page
+        required: false
+        schema:
+          type: integer
+          format: int32
+          default: 0
+      - in: query
+        name: size
+        required: false
+        schema:
+          type: integer
+          format: int32
+          default: 10
+      - in: query
+        name: sort
+        required: false
+        schema:
+          type: string
+          default: name
+      - in: query
+        name: direction
+        required: false
+        schema:
+          type: string
+          default: ascending
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OwnerPageDto"
+          description: OK
+        "400":
+          content:
+            '*/*':
+              schema:
+                $ref: "#/components/schemas/ProblemDetail"
+          description: Bad Request
+        "404":
+          content:
+            '*/*':
+              schema:
+                type: string
+          description: Not Found
+        "500":
+          content:
+            '*/*':
+              schema:
+                $ref: "#/components/schemas/ProblemDetail"
+          description: Internal Server Error
+      summary: List a page of owners
       tags:
       - owner-rest-controller
   /api/owners/{ownerId}:
@@ -1686,6 +1750,22 @@ components:
       - firstName
       - lastName
       - telephone
+    OwnerPageDto:
+      type: object
+      description: A page of owners and the total number matching the search.
+      properties:
+        items:
+          type: array
+          description: Owners on this page.
+          items:
+            $ref: "#/components/schemas/OwnerDto"
+        total:
+          type: integer
+          format: int64
+          description: Total matching owners across all pages.
+      required:
+      - items
+      - total
     PetDto:
       type: object
       properties:

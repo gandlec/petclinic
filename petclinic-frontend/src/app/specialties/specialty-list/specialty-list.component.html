@@ -2,6 +2,7 @@
   <div class="container xd-container">
 
     <h2>Specialties</h2>
+    <app-table-filter #filter></app-table-filter>
     <table id="specialties" class="table table-striped">
       <thead>
       <tr>
@@ -11,7 +12,7 @@
       </tr>
       </thead>
       <tbody>
-      <tr *ngFor="let specialty of specialties; let element_id=index">
+      <tr *ngFor="let specialty of specialties | tableFilter: filter.query : ['name']; let element_id=index">
         <td>
           <input [id]=element_id [readonly]="true" type="text" class="form-control" [(ngModel)]="specialty.name" name="spec_name" />
         </td>

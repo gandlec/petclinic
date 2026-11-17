@@ -1,9 +1,16 @@
-import { Owner } from './owner';
+import {Owner} from './owner';
+
+export type OwnerSortColumn = 'name' | 'address' | 'city' | 'telephone' | 'pets';
 
 export interface OwnerPage {
-  content: Owner[];
-  totalElements: number;
-  totalPages: number;
-  number: number;
+  items: Owner[];
+  total: number;
+}
+
+export interface OwnerPageQuery {
+  search: string;
+  page: number;
   size: number;
+  sort: OwnerSortColumn;
+  direction: 'ascending' | 'descending';
 }

@@ -15,67 +15,45 @@ Full-stack PetClinic application, managing veterinary clinic operations (owners,
 - `petclinic-frontend/` - Angular 16 SPA (Angular Material + Bootstrap 3), npm built
 - `notification-service/` - Spring Boot app on :8090 that texts owners; the backend POSTs to it after every booked visit
 - `petclinic-commons/` - jar both apps depend on, `mvn install`ed first; every call crossing it is traced (AspectJ)
+- `petclinic-database/` - Maven module building the embedded-Postgres launcher jar started by `./start-database.sh`
+- `petclinic-observability/` - Tempo/OTel config for `./start-tempo.sh` and `./start-grafana.sh`
+- `petclinic-test/` - Playwright/Cucumber e2e suite against the running apps; own [AGENTS.md](petclinic-test/AGENTS.md)
+- `petclinic-chatbot/` - optional Spring AI triage assistant on :8082, calls the backend's MCP server; see its [README](petclinic-chatbot/README.md)
+- `docker/` - compose files for `./start-docker.sh`, a per-branch containerized instance of the whole stack
+- `refactoring-tools/` - self-contained OpenRewrite recipes module, run against the backend from the CLI; see its [README](refactoring-tools/README.md)
 
 ## Common Commands
 
 ### Helper Scripts
 Each script is foreground; run them in separate terminals.
 ```sh
-./start-database.sh        # embedded Postgres on localhost:5432
+./start-database.sh        # embedded Postgres on localhost:5432, built from petclinic-database/
 ./start-backend.sh         # starts notification-service on :8090 and backend on :8080 (also MCP at /mcp) after installing commons
 ./start-frontend.sh        # Angular dev server on localhost:4200
 ./start-grafana.sh         # Starts grafana on localhost:3300 in a docker container
+./start-tempo.sh           # No-Docker alternative to start-grafana.sh: Tempo alone, :3200 + OTLP :4318
+./start-docker.sh          # The whole stack containerized, one isolated instance per branch (see docker/)
 ```
 Wait for `✅ started <name> on port <n>` or `❌ …`, never for a fixed timeout. A port held
 by an orphan is reported in < 1s, before anything is built or wiped — the script
 prints the squatter's PID and stops; killing it is your call.
 
-### Backend (petclinic-backend/)
+### Frontend (petclinic-frontend/) — non-obvious scripts only
 ```sh
-mvn spring-boot:run              # Run backend
-mvn test                         # Run tests
-mvn clean install                # Build
-mvn test -Dtest=ClassName#methodName # Run a single test
-```
-
-### Frontend (petclinic-frontend/)
-```sh
-npm start                           # Dev server on localhost:4200
-npm run build                       # Production build
-npm test                            # Karma tests
-npm run test-headless               # Headless Chrome tests
-npm run test:arch                   # imports adhere to docs/frontend-packages.puml
-npm run e2e                         # Protractor e2e tests
+npm run test-headless    # Karma in headless Chrome, what CI runs
+npm run test:arch        # imports adhere to docs/frontend-packages.puml
 ```
 
 ## Architecture
 
-### Backend Architecture
-
-**Layered Structure:**
-1. REST Controllers (`petclinic-backend/src/main/java/.../rest/`) - expose API endpoints
-2. Mappers (`mapper/`) - hand-written `@Component` entity↔DTO conversion
-3. Repository Layer (`repository/`) - Spring Data JPA interfaces (no service layer!)
-4. Domain Model (`domain/`) - JPA entities (Owner, Pet, Vet, Visit, Specialty, PetType, User, Role)
-5. Notification (`notification/`) - `NotificationServiceClient`, called after a visit is booked:
-   an HTTP POST to notification-service, best effort (a failure is logged, the booking stands).
-   Takes plain values, never an entity, and reaches no repository
-
-**Data Flow:**
-Request → REST Controller → Repository / Mapper → JPA Entity
-Response ← REST Controller ← Mapper (Entity→DTO) ← Repository
-
-**Key Patterns:**
-- DTOs are hand-written (not generated) in `src/main/java/.../rest/dto/` 
-- `/openapi.yaml` is generated (don't edit it!) from Java DTOs & REST Controllers by `OpenApiExtractorTest`
+Backend layering, the database, the REST contract, the domain model and Java code style are
+scoped to [petclinic-backend/AGENTS.md](petclinic-backend/AGENTS.md) — it auto-loads only for
+conversations rooted there. Before changing how the layers, the database or the notification
+call work, read the decisions and their reasons in [ARCHITECTURE.md](ARCHITECTURE.md). When a
+guardrail test fails, or a living diagram no longer matches the code, the drift checks and what
+each of them asserts are described in [GUARDRAILS.md](GUARDRAILS.md).
 
 ## Additional Knowledge
-
-When a guardrail test fails, or a living diagram no longer matches the code, the drift
-checks and what each of them asserts are described in [GUARDRAILS.md](GUARDRAILS.md).
-
-Before changing how the layers, the database or the notification call work, read the decisions
-and their reasons in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ### Frontend UX design system
 `petclinic-frontend/src/app/design-system/` holds the standardised widgets. Every
@@ -117,53 +95,6 @@ drives a whole local stack — a browser, a database, Tempo, PlantUML, a Maven b
 there is no online version and no PR automation for it. Run `/human-review` when you want
 one. `diagram-preview.yml` still posts a PR comment rendering the branch's own diagrams,
 which is a different and much cheaper thing: proxy URLs, no runner render, no publishing.
-
-### Database
-- **Dev:** Embedded PostgreSQL via `./start-database.sh` (Java jar, localhost:5432)
-- **Tests:** Embedded PostgreSQL (auto-started in-process, no setup needed)
-- **Flyway boots from three locations** (`ddl-auto=none`); an empty DB before that is normal.
-  `db/migration/` is the versioned **schema** chain — no rows here, ever: seed data in a frozen
-  migration is what forced the old V5/V7/V8 to patch each other. `db/reference/R__reference.sql`
-  holds the lookup rows every environment needs (pet types, specialties), as a repeatable upsert
-  with literal ids. `db/seed/R__seed.sql` is the demo **dataset** ("Default"), repeatable, so edit
-  it freely; it re-runs on checksum change after all versioned migrations and after the reference
-  rows, opening with `TRUNCATE ... RESTART IDENTITY` (ids are deterministic — owner 1 = Kevin
-  McCallister, pet 3 = Milton). A second dataset = a sibling location reusing the name
-  `R__seed.sql`, picked by swapping `spring.flyway.locations`; Flyway refuses to boot on two
-  resolved migrations sharing one description, so two can never both apply.
-- **Tests start on an empty database** (schema + reference rows), never on the seed: the tests'
-  `src/test/resources/config/application.properties` drops `db/seed` and gives every test method
-  a fresh Zonky copy. A test that reads seeded rows declares it — `@DefaultFixture` (Spring),
-  `test.use({dbFixture: 'default'})` (Playwright), `@fixture:default` (Cucumber).
-- ⚠️ `./start-database.sh` starts by `rm -rf data`, wiping any rows added at runtime. Use it only
-  for a deliberate reset; to keep runtime data, start Postgres from the jar directly.
-
-## API Endpoints
-Backend exposes REST API at http://localhost:8080/api/
-REST Contract: 
-- Owners: `/api/owners`, `/api/owners/{id}`
-- Pets: `/api/pets`, `/api/pets/{id}`
-- Vets: `/api/vets`, `/api/vets/{id}`
-- Visits: `/api/visits`
-- PetTypes: `/api/pettypes`
-- Specialties: `/api/specialties`
-- Users: `/api/users`
-
-## Domain Model
-Core entities and relationships:
-- **Owner** 1→N **Pet** N→1 **PetType**
-- **Pet** 1→N **Visit**
-- **Vet** N→N **Specialty** (via `vet_specialties` join table)
-- **User** 1→N **Role**
-
-## Java Code Style
-- Keep < 120 chars / line
-- Keep methods under 30 lines
-- Use constructor injection in src/main, `@Autowired` only in tests
-- Use `@Transactional` only when strictly necessary to wrap 2+ DB updates
-- Global REST exception handling is done via `@RestControllerAdvice`
-- Apply `@Validated` on every `@RequestBody`
-- Write `equals`/`hashCode`/`toString` to a class only if it actually needs it
 
 ## Core Values
 - Write non-trivial code using TDD

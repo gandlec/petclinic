@@ -24,6 +24,10 @@ export interface paths {
     /** Count owners */
     get: operations["countOwners"];
   };
+  "/api/owners/page": {
+    /** List a page of owners */
+    get: operations["listOwnersPage"];
+  };
   "/api/owners/{ownerId}": {
     /** Get an owner by ID */
     get: operations["getOwner"];
@@ -169,6 +173,16 @@ export interface components {
        * @example 6085551023
        */
       telephone: string;
+    };
+    /** @description A page of owners and the total number matching the search. */
+    OwnerPageDto: {
+      /** @description Owners on this page. */
+      items: components["schemas"]["OwnerDto"][];
+      /**
+       * Format: int64
+       * @description Total matching owners across all pages.
+       */
+      total: number;
     };
     PetDto: {
       /**
@@ -557,7 +571,7 @@ export interface operations {
   listOwners: {
     parameters: {
       query?: {
-        lastName?: string;
+        search?: string;
       };
     };
     responses: {
@@ -626,6 +640,44 @@ export interface operations {
       200: {
         content: {
           "*/*": number;
+        };
+      };
+      /** @description Bad Request */
+      400: {
+        content: {
+          "*/*": components["schemas"]["ProblemDetail"];
+        };
+      };
+      /** @description Not Found */
+      404: {
+        content: {
+          "*/*": string;
+        };
+      };
+      /** @description Internal Server Error */
+      500: {
+        content: {
+          "*/*": components["schemas"]["ProblemDetail"];
+        };
+      };
+    };
+  };
+  /** List a page of owners */
+  listOwnersPage: {
+    parameters: {
+      query?: {
+        search?: string;
+        page?: number;
+        size?: number;
+        sort?: string;
+        direction?: string;
+      };
+    };
+    responses: {
+      /** @description OK */
+      200: {
+        content: {
+          "application/json": components["schemas"]["OwnerPageDto"];
         };
       };
       /** @description Bad Request */

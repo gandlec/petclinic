@@ -198,6 +198,32 @@ public class VisitTest {
     }
 
     @Test
+    void create_rejectsDateBeforePetBirth() throws Exception {
+        VisitDto newVisit = new VisitDto()
+                .setPetId(petId)
+                .setDate(PetTest.BIRTH_DATE.minusDays(1))
+                .setDescription("annual checkup");
+
+        mockMvc.perform(post("/api/visits")
+                .content(mapper.writeValueAsString(newVisit))
+                .contentType(MediaType.APPLICATION_JSON_VALUE))
+                .andExpect(status().isBadRequest());
+    }
+
+    @Test
+    void create_rejectsDateMoreThanOneYearAhead() throws Exception {
+        VisitDto newVisit = new VisitDto()
+                .setPetId(petId)
+                .setDate(LocalDate.now().plusYears(1).plusDays(1))
+                .setDescription("annual checkup");
+
+        mockMvc.perform(post("/api/visits")
+                .content(mapper.writeValueAsString(newVisit))
+                .contentType(MediaType.APPLICATION_JSON_VALUE))
+                .andExpect(status().isBadRequest());
+    }
+
+    @Test
     void update_ok() throws Exception {
         VisitFieldsDto update = new VisitFieldsDto()
                 .setDate(LocalDate.now().plusDays(1))
@@ -210,6 +236,33 @@ public class VisitTest {
 
         Visit updated = visitRepository.findById(visitId).orElseThrow();
         assertThat(updated.getDescription()).isEqualTo("updated description");
+    }
+
+    @Test
+    void update_rejectsDateOutsideAllowedRange() throws Exception {
+        LocalDate originalDate = visitRepository.findById(visitId).orElseThrow().getDate();
+        VisitFieldsDto update = new VisitFieldsDto()
+                .setDate(LocalDate.now().plusYears(1).plusDays(1))
+                .setDescription("updated description");
+
+        mockMvc.perform(put("/api/visits/" + visitId)
+                .content(mapper.writeValueAsString(update))
+                .contentType(MediaType.APPLICATION_JSON_VALUE))
+                .andExpect(status().isBadRequest());
+
+        assertThat(visitRepository.findById(visitId).orElseThrow().getDate()).isEqualTo(originalDate);
+    }
+
+    @Test
+    void update_rejectsDateBeforePetBirth() throws Exception {
+        VisitFieldsDto update = new VisitFieldsDto()
+                .setDate(PetTest.BIRTH_DATE.minusDays(1))
+                .setDescription("updated description");
+
+        mockMvc.perform(put("/api/visits/" + visitId)
+                .content(mapper.writeValueAsString(update))
+                .contentType(MediaType.APPLICATION_JSON_VALUE))
+                .andExpect(status().isBadRequest());
     }
 
     @Test

@@ -34,6 +34,7 @@ import org.springframework.security.test.context.support.WithMockUser;
 import org.springframework.test.web.servlet.MockMvc;
 
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
@@ -136,16 +137,58 @@ public class OwnerTest {
     }
 
     @Test
-    void getAllWithAddressFilter() throws Exception {
+    void getAllWithAddressFilter_matchesLastNameSubstringCaseInsensitively() throws Exception {
         Owner owner2 = TestData.anOwner();
         owner2.setLastName("JavaBeans");
         int owner2Id = ownerRepository.save(owner2).getId();
 
-        List<OwnerDto> owners = search("/api/owners?lastName=Java");
+        List<OwnerDto> owners = search("/api/owners?search=java");
 
         assertThat(owners)
                 .extracting(OwnerDto::getId, OwnerDto::getLastName)
                 .contains(Assertions.tuple(owner2Id, "JavaBeans"));
+    }
+
+    @Test
+    void search_matchesFirstNameSubstring() throws Exception {
+        List<OwnerDto> owners = search("/api/owners?search=eorg");
+
+        assertThat(owners).extracting(OwnerDto::getId).contains(ownerId);
+    }
+
+    @Test
+    void search_matchesAddress() throws Exception {
+        List<OwnerDto> owners = search("/api/owners?search=Baker St");
+
+        assertThat(owners).extracting(OwnerDto::getId).contains(ownerId);
+    }
+
+    @Test
+    void search_matchesCity() throws Exception {
+        List<OwnerDto> owners = search("/api/owners?search=london");
+
+        assertThat(owners).extracting(OwnerDto::getId).contains(ownerId);
+    }
+
+    @Test
+    void search_matchesTelephone() throws Exception {
+        List<OwnerDto> owners = search("/api/owners?search=234567");
+
+        assertThat(owners).extracting(OwnerDto::getId).contains(ownerId);
+    }
+
+    @Test
+    void search_matchesPetName() throws Exception {
+        List<OwnerDto> owners = search("/api/owners?search=rosy");
+
+        assertThat(owners).extracting(OwnerDto::getId).contains(ownerId);
+    }
+
+    @Test
+    void search_blankListsEveryOwner() throws Exception {
+        List<OwnerDto> owners = search("/api/owners?search=");
+
+        assertThat(owners).extracting(OwnerDto::getId).contains(ownerId);
     }
 
     private List<OwnerDto> search(String uriTemplate) throws Exception {
@@ -161,10 +204,113 @@ public class OwnerTest {
     }
 
     @Test
-    void getAllWithNameFilter_notFound() throws Exception {
-        List<OwnerDto> results = search("/api/owners?lastName=NonExistent");
+    void search_noMatch_returnsEmpty() throws Exception {
+        List<OwnerDto> results = search("/api/owners?search=NonExistent");
 
         assertThat(results).isEmpty();
+    }
+
+    @Test
+    void page_returnsTotalAndRequestedSliceInDisplayedNameOrder() throws Exception {
+        saveOwner("Zoe", "Zulu");
+        saveOwner("Amy", "Zee");
+        saveOwner("Amy", "Able");
+        saveOwner("Bobby", "Brown");
+        saveOwner("Molly", "Moore");
+        saveOwner("Victor", "Vance");
+
+        JsonNode firstPage = page("/api/owners/page?page=0&size=5");
+        JsonNode secondPage = page("/api/owners/page?page=1&size=5");
+
+        assertThat(firstPage.path("total").asLong()).isEqualTo(7);
+        assertThat(firstPage.path("items").size()).isEqualTo(5);
+        assertThat(ownerNames(firstPage)).containsExactly(
+                "Amy Able", "Amy Zee", "Bobby Brown", "George Franklin", "Molly Moore");
+        assertThat(ownerNames(secondPage)).containsExactly("Victor Vance", "Zoe Zulu");
+    }
+
+    @Test
+    void page_filtersBeforePagingAndSortsPetsByJoinedAlphabeticalNames() throws Exception {
+        Owner amy = saveOwner("Amy", "Alpha");
+        addPet(amy, "Zed");
+        addPet(amy, "Alpha");
+        Owner zoe = saveOwner("Zoe", "Zulu");
+        addPet(zoe, "Mango");
+
+        JsonNode searchPage = page("/api/owners/page?search=rosy&page=0&size=5");
+        JsonNode petsPage = page("/api/owners/page?page=0&size=5&sort=pets");
+
+        assertThat(searchPage.path("total").asLong()).isEqualTo(1);
+        assertThat(ownerNames(searchPage)).containsExactly("George Franklin");
+        assertThat(ownerNames(petsPage)).containsExactly("Amy Alpha", "Zoe Zulu", "George Franklin");
+    }
+
+    @Test
+    void page_rejectsUnsupportedPageSizeAndSortColumn() throws Exception {
+        mockMvc.perform(get("/api/owners/page?size=7"))
+                .andExpect(status().isBadRequest());
+        mockMvc.perform(get("/api/owners/page?sort=unknown"))
+                .andExpect(status().isBadRequest());
+    }
+
+    @Test
+    void page_sortsByAddressCityAndTelephone() throws Exception {
+        Owner george = ownerRepository.findById(ownerId).orElseThrow();
+        george.setAddress("Delta");
+        george.setCity("London");
+        george.setTelephone("5000000000");
+        ownerRepository.save(george);
+
+        Owner amy = saveOwner("Amy", "Alpha");
+        amy.setAddress("Alpha");
+        amy.setCity("York");
+        amy.setTelephone("9000000000");
+        ownerRepository.save(amy);
+        Owner zoe = saveOwner("Zoe", "Zulu");
+        zoe.setAddress("Beta");
+        zoe.setCity("Bath");
+        zoe.setTelephone("1000000000");
+        ownerRepository.save(zoe);
+
+        assertThat(ownerNames(page("/api/owners/page?sort=address")))
+                .containsExactly("Amy Alpha", "Zoe Zulu", "George Franklin");
+        assertThat(ownerNames(page("/api/owners/page?sort=city")))
+                .containsExactly("Zoe Zulu", "George Franklin", "Amy Alpha");
+        assertThat(ownerNames(page("/api/owners/page?sort=telephone")))
+                .containsExactly("Zoe Zulu", "George Franklin", "Amy Alpha");
+    }
+
+    private Owner saveOwner(String firstName, String lastName) {
+        Owner owner = TestData.anOwner();
+        owner.setFirstName(firstName);
+        owner.setLastName(lastName);
+        return ownerRepository.save(owner);
+    }
+
+    private void addPet(Owner owner, String name) {
+        Pet pet = new Pet();
+        pet.setName(name);
+        pet.setBirthDate(LocalDate.now());
+        pet.setType(petType);
+        owner.addPet(pet);
+        petRepository.save(pet);
+    }
+
+    private JsonNode page(String uri) throws Exception {
+        String responseJson = mockMvc.perform(get(uri))
+                .andExpect(status().isOk())
+                .andExpect(content().contentType("application/json"))
+                .andReturn()
+                .getResponse()
+                .getContentAsString();
+        return mapper.readTree(responseJson);
+    }
+
+    private List<String> ownerNames(JsonNode page) {
+        List<String> names = new java.util.ArrayList<>();
+        page.path("items").forEach(owner ->
+                names.add(owner.path("firstName").asText() + " " + owner.path("lastName").asText()));
+        return names;
     }
 
     @Test

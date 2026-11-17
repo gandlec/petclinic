@@ -21,6 +21,9 @@ export class VisitAddComponent implements OnInit {
   currentPet: Pet;
   currentOwner: Owner;
   currentPetType: PetType;
+  minVisitDate: moment.Moment;
+  maxVisitDate: moment.Moment;
+  dateLimitsLoaded = false;
   addedSuccess = false;
   errorMessage: string;
 
@@ -44,6 +47,7 @@ export class VisitAddComponent implements OnInit {
         this.currentPet = pet;
         this.visit.pet = this.currentPet;
         this.currentPetType = this.currentPet.type;
+        this.setVisitDateLimits(pet);
         this.ownerService.getOwnerById(pet.ownerId).subscribe(
           owner => {
             this.currentOwner = owner;
@@ -51,6 +55,12 @@ export class VisitAddComponent implements OnInit {
         )
       },
       error => this.errorMessage = error as any);
+  }
+
+  private setVisitDateLimits(pet: Pet) {
+    this.minVisitDate = moment(pet.birthDate, 'YYYY-MM-DD', true);
+    this.maxVisitDate = moment().add(1, 'year').startOf('day');
+    this.dateLimitsLoaded = true;
   }
 
   onSubmit(visit: Visit) {

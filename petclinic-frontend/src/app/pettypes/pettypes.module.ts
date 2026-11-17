@@ -6,9 +6,11 @@ import {PettypeListComponent} from './pettype-list/pettype-list.component';
 import {PettypeAddComponent} from './pettype-add/pettype-add.component';
 import {PettypeEditComponent} from './pettype-edit/pettype-edit.component';
 import {PettypesRoutingModule} from './pettypes-routing.module';
+import {DesignSystemModule} from '../design-system/design-system.module';
 
 @NgModule({
   imports: [
+    DesignSystemModule,
     CommonModule,
     FormsModule,
     PettypesRoutingModule

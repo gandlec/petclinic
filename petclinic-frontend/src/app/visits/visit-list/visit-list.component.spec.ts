@@ -5,6 +5,7 @@ import {CUSTOM_ELEMENTS_SCHEMA} from '@angular/core';
 
 import {VisitListComponent} from './visit-list.component';
 import {FormsModule} from '@angular/forms';
+import {DesignSystemModule} from '../../design-system/design-system.module';
 import {VisitService} from '../visit.service';
 import {ActivatedRoute, Router} from '@angular/router';
 import {ActivatedRouteStub, RouterStub} from '../../testing/router-stubs';
@@ -32,7 +33,7 @@ describe('VisitListComponent', () => {
     TestBed.configureTestingModule({
       declarations: [VisitListComponent],
       schemas: [CUSTOM_ELEMENTS_SCHEMA],
-      imports: [FormsModule],
+      imports: [FormsModule, DesignSystemModule],
       providers: [
         {provide: VisitService, useClass: VisitServiceStub},
         {provide: Router, useClass: RouterStub},

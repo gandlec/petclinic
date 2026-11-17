@@ -2,6 +2,7 @@
   <div class="container xd-container">
 
     <h2>Pet Types</h2>
+    <app-table-filter #filter></app-table-filter>
     <table id="pettypes" class="table table-striped">
       <thead>
       <tr>
@@ -11,7 +12,7 @@
       </tr>
       </thead>
       <tbody>
-      <tr *ngFor="let pettype of pettypes; let element_id=index">
+      <tr *ngFor="let pettype of pettypes | tableFilter: filter.query : ['name']; let element_id=index">
         <td>
           <input [id]=element_id [readonly]="true" type="text" class="form-control" [(ngModel)]="pettype.name" name="pettype_name" />
         </td>

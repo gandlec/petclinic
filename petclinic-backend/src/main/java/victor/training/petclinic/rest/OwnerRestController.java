@@ -1,9 +1,16 @@
 package victor.training.petclinic.rest;
 
 import java.net.URI;
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
+import java.util.Objects;
+import java.util.Set;
+import java.util.stream.Collectors;
 
+import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.server.ResponseStatusException;
 import victor.training.petclinic.mapper.OwnerMapper;
 import victor.training.petclinic.mapper.PetMapper;
 import victor.training.petclinic.mapper.VisitMapper;
@@ -17,6 +24,7 @@ import victor.training.petclinic.repository.PetTypeRepository;
 import victor.training.petclinic.repository.VisitRepository;
 import victor.training.petclinic.rest.dto.OwnerDto;
 import victor.training.petclinic.rest.dto.OwnerFieldsDto;
+import victor.training.petclinic.rest.dto.OwnerPageDto;
 import victor.training.petclinic.rest.dto.PetDto;
 import victor.training.petclinic.rest.dto.PetFieldsDto;
 import victor.training.petclinic.rest.dto.VisitFieldsDto;
@@ -86,9 +94,80 @@ public class OwnerRestController {
                     array = @ArraySchema(schema = @Schema(implementation = OwnerDto.class)),
                     examples = @ExampleObject(name = "sample", value = ApiExamples.OWNERS)))
     @GetMapping(produces = "application/json")
-    public List<OwnerDto> listOwners(@RequestParam(name = "lastName", defaultValue = "") String lastName) {
-        List<Owner> owners = ownerRepository.findByLastNameStartingWith(lastName);
-        return ownerMapper.toOwnerDtoCollection(owners);
+    public List<OwnerDto> listOwners(@RequestParam(name = "search", defaultValue = "") String search) {
+        return ownerMapper.toOwnerDtoCollection(matchingOwners(search));
+    }
+
+    @Operation(operationId = "listOwnersPage", summary = "List a page of owners")
+    @GetMapping(path = "/page", produces = "application/json")
+    public OwnerPageDto listOwnersPage(
+            @RequestParam(name = "search", defaultValue = "") String search,
+            @RequestParam(name = "page", defaultValue = "0") int page,
+            @RequestParam(name = "size", defaultValue = "10") int size,
+            @RequestParam(name = "sort", defaultValue = "name") String sort,
+            @RequestParam(name = "direction", defaultValue = "ascending") String direction) {
+        validatePageRequest(page, size, sort, direction);
+        List<Owner> matching = matchingOwners(search);
+        matching.sort(ownerComparator(sort, direction));
+
+        long start = (long) page * size;
+        List<OwnerDto> items = start >= matching.size() ? List.of()
+                : ownerMapper.toOwnerDtoCollection(matching.subList((int) start,
+                        (int) Math.min(start + size, matching.size())));
+        return new OwnerPageDto(items, matching.size());
+    }
+
+    private void validatePageRequest(int page, int size, String sort, String direction) {
+        if (page < 0 || !Set.of(5, 10, 20).contains(size)
+                || !Set.of("name", "address", "city", "telephone", "pets").contains(sort)
+                || !Set.of("ascending", "descending").contains(direction)) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Invalid Owners page request");
+        }
+    }
+
+    private List<Owner> matchingOwners(String search) {
+        List<Owner> owners = ownerRepository.findAll();
+        List<Owner> matching = search.isBlank() ? owners
+                : owners.stream().filter(owner -> matchesSearch(owner, search)).toList();
+        return new ArrayList<>(matching);
+    }
+
+    private Comparator<Owner> ownerComparator(String sort, String direction) {
+        Comparator<Owner> byColumn = Comparator.comparing(owner -> sortValue(owner, sort),
+                String.CASE_INSENSITIVE_ORDER);
+        if ("descending".equals(direction)) {
+            byColumn = byColumn.reversed();
+        }
+        return byColumn.thenComparing(Owner::getId);
+    }
+
+    private String sortValue(Owner owner, String sort) {
+        return switch (sort) {
+            case "name" -> owner.getFirstName() + " " + owner.getLastName();
+            case "address" -> Objects.toString(owner.getAddress(), "");
+            case "city" -> Objects.toString(owner.getCity(), "");
+            case "telephone" -> Objects.toString(owner.getTelephone(), "");
+            case "pets" -> owner.getPets().stream()
+                    .map(pet -> Objects.toString(pet.getName(), ""))
+                    .sorted(String.CASE_INSENSITIVE_ORDER)
+                    .collect(Collectors.joining(" "));
+            default -> throw new IllegalArgumentException("Unsupported Owners sort column: " + sort);
+        };
+    }
+
+    // Matches any visible column of the owners table — name, address, city, phone, pet
+    // names — case-insensitively and by substring, not just a last-name prefix (issue #24).
+    private boolean matchesSearch(Owner owner, String search) {
+        String needle = search.toLowerCase();
+        return containsIgnoreCase(owner.getFirstName() + " " + owner.getLastName(), needle)
+                || containsIgnoreCase(owner.getAddress(), needle)
+                || containsIgnoreCase(owner.getCity(), needle)
+                || containsIgnoreCase(owner.getTelephone(), needle)
+                || owner.getPets().stream().anyMatch(pet -> containsIgnoreCase(pet.getName(), needle));
+    }
+
+    private boolean containsIgnoreCase(String value, String needleLower) {
+        return value != null && value.toLowerCase().contains(needleLower);
     }
 
     @Operation(operationId = "countOwners", summary = "Count owners")
@@ -165,7 +244,9 @@ public class OwnerRestController {
     @Operation(operationId = "addVisitToOwner", summary = "Add a visit for an owner's pet")
     @PostMapping("{ownerId}/pets/{petId}/visits")
     public ResponseEntity<Void> addVisitToOwner(@PathVariable int ownerId, @PathVariable int petId,
-            @RequestBody VisitFieldsDto visitFieldsDto) {
+            @RequestBody @Validated VisitFieldsDto visitFieldsDto) {
+        Pet pet = petRepository.findById(petId).orElseThrow();
+        VisitDateValidator.validate(visitFieldsDto.getDate(), pet);
         int visitId = bookVisit(ownerId, petId, visitFieldsDto);
 
         URI createdUri = UriComponentsBuilder.fromPath("/api/pets/{petId}/visits/{id}")

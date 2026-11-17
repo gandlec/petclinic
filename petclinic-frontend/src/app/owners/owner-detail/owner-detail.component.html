@@ -31,10 +31,11 @@
     <br />
     <br />
     <h2>Pets and Visits</h2>
+    <app-table-filter #filter label="Filter pets and visits"></app-table-filter>
 
     <table class="table table-striped">
       <tr>
-        <app-pet-list *ngFor="let pet of owner.pets" [pet]="pet"></app-pet-list>
+        <app-pet-list *ngFor="let pet of owner.pets | tableFilter: filter.query : ['name', 'birthDate', 'type.name', 'visits.date', 'visits.description']" [pet]="pet"></app-pet-list>
       </tr>
     </table>
   </div>

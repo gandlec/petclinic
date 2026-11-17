@@ -1,6 +1,7 @@
-import {Component, OnInit} from '@angular/core';
+import {Component, OnDestroy, OnInit} from '@angular/core';
 import {OwnerService} from '../owner.service';
 import {Owner} from '../owner';
+import {OwnerSortColumn} from '../owner-page';
 import {Router} from '@angular/router';
 import { finalize } from 'rxjs/operators';
 import {Subscription} from 'rxjs';
@@ -10,26 +11,29 @@ import {Subscription} from 'rxjs';
   templateUrl: './owner-list.component.html',
   styleUrls: ['./owner-list.component.css']
 })
-export class OwnerListComponent implements OnInit {
-  errorMessage: string;
-  lastName: string;
+export class OwnerListComponent implements OnInit, OnDestroy {
+  errorMessage = '';
   owners: Owner[];
-  listOfOwnersWithLastName: Owner[];
   isOwnersDataReceived: boolean = false;
-  private load: Subscription;
+  readonly pageSizes = [5, 10, 20];
+  pageSize = 10;
+  pageIndex = 0;
+  sortColumn: OwnerSortColumn = 'name';
+  sortDirection: 'ascending' | 'descending' = 'ascending';
+  total = 0;
+  query = '';
+  private pageRequest: Subscription;
 
   constructor(private router: Router, private ownerService: OwnerService) {
 
   }
 
   ngOnInit() {
-    this.load = this.ownerService.getOwners().pipe(
-      finalize(() => {
-        this.isOwnersDataReceived = true;
-      })
-    ).subscribe(
-      owners => this.owners = owners,
-      error => this.errorMessage = error as any);
+    this.loadPage();
+  }
+
+  ngOnDestroy(): void {
+    this.pageRequest?.unsubscribe();
   }
 
   onSelect(owner: Owner) {
@@ -40,13 +44,74 @@ export class OwnerListComponent implements OnInit {
     this.router.navigate(['/owners/add']);
   }
 
-  // Only the latest query may answer: a search sent while the initial load is still in
-  // flight would otherwise be overwritten by the full list when it lands afterwards.
-  searchByLastName(lastName: string) {
-    this.load?.unsubscribe();
-    const owners$ = lastName ? this.ownerService.searchOwners(lastName) : this.ownerService.getOwners();
-    this.load = owners$.subscribe(
-      owners => this.owners = owners,
-      () => this.owners = null);
+  onSearchChange(query: string): void {
+    this.query = query;
+    this.pageIndex = 0;
+    this.loadPage();
   }
+
+  sortBy(column: OwnerSortColumn): void {
+    this.sortDirection = this.sortColumn === column && this.sortDirection === 'ascending'
+      ? 'descending' : 'ascending';
+    this.sortColumn = column;
+    this.pageIndex = 0;
+    this.loadPage();
+  }
+
+  setPageSize(size: number): void {
+    this.pageSize = size;
+    this.pageIndex = 0;
+    this.loadPage();
+  }
+
+  previousPage(): void {
+    if (this.pageIndex > 0) {
+      this.pageIndex--;
+      this.loadPage();
+    }
+  }
+
+  nextPage(): void {
+    if ((this.pageIndex + 1) * this.pageSize < this.total) {
+      this.pageIndex++;
+      this.loadPage();
+    }
+  }
+
+  firstRow(): number {
+    return this.total === 0 ? 0 : this.pageIndex * this.pageSize + 1;
+  }
+
+  lastRow(): number {
+    return Math.min((this.pageIndex + 1) * this.pageSize, this.total);
+  }
+
+  private loadPage(): void {
+    this.pageRequest?.unsubscribe();
+    this.errorMessage = '';
+    this.pageRequest = this.ownerService.getOwnersPage({
+      search: this.query,
+      page: this.pageIndex,
+      size: this.pageSize,
+      sort: this.sortColumn,
+      direction: this.sortDirection
+    }).pipe(finalize(() => {
+      this.isOwnersDataReceived = true;
+    })).subscribe(
+      page => {
+        this.errorMessage = '';
+        this.owners = page.items;
+        this.total = page.total;
+        if (this.pageIndex > 0 && this.owners.length === 0) {
+          this.pageIndex = this.total === 0 ? 0 : Math.ceil(this.total / this.pageSize) - 1;
+          this.loadPage();
+        }
+      },
+      error => {
+        this.errorMessage = error;
+        this.owners = [];
+        this.total = 0;
+      });
+  }
+
 }

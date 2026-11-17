@@ -5,6 +5,7 @@ import {CUSTOM_ELEMENTS_SCHEMA} from '@angular/core';
 
 import {VetListComponent} from './vet-list.component';
 import {FormsModule} from '@angular/forms';
+import {DesignSystemModule} from '../../design-system/design-system.module';
 import {VetService} from '../vet.service';
 import {ActivatedRoute, Router} from '@angular/router';
 import {ActivatedRouteStub, RouterStub} from '../../testing/router-stubs';
@@ -30,7 +31,7 @@ describe('VetListComponent', () => {
     TestBed.configureTestingModule({
       declarations: [VetListComponent],
       schemas: [CUSTOM_ELEMENTS_SCHEMA],
-      imports: [FormsModule],
+      imports: [FormsModule, DesignSystemModule],
       providers: [
         {provide: VetService, useClass: VetServiceStub},
         {provide: Router, useClass: RouterStub},

@@ -9,7 +9,7 @@ import victor.training.petclinic.domain.Owner;
 
 public interface OwnerRepository extends Repository<Owner, Integer> {
 
-    List<Owner> findByLastNameStartingWith(String lastName);
+    List<Owner> findAll();
 
     Optional<Owner> findById(int id);
 

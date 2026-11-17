@@ -19,6 +19,8 @@ import org.springframework.validation.annotation.Validated;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.web.util.UriComponentsBuilder;
+import victor.training.petclinic.domain.Pet;
+import victor.training.petclinic.repository.PetRepository;
 
 import java.util.List;
 
@@ -30,10 +32,12 @@ public class VisitRestController {
 
     private final VisitRepository visitRepository;
     private final VisitMapper visitMapper;
+    private final PetRepository petRepository;
 
-    public VisitRestController(VisitRepository visitRepository, VisitMapper visitMapper) {
+    public VisitRestController(VisitRepository visitRepository, VisitMapper visitMapper, PetRepository petRepository) {
         this.visitRepository = visitRepository;
         this.visitMapper = visitMapper;
+        this.petRepository = petRepository;
     }
 
     @GetMapping
@@ -54,6 +58,8 @@ public class VisitRestController {
 
     @PostMapping
     public ResponseEntity<Void> addVisit(@RequestBody @Validated VisitDto visitDto) {
+        Pet pet = petRepository.findById(visitDto.getPetId()).orElseThrow();
+        VisitDateValidator.validate(visitDto.getDate(), pet);
         int id = bookVisit(visitDto);
         return ResponseEntity.created(UriComponentsBuilder.fromPath("/api/visits/{id}")
                 .buildAndExpand(id).toUri())
@@ -76,6 +82,7 @@ public class VisitRestController {
     @PutMapping("{visitId}")
     public void updateVisit(@PathVariable int visitId, @RequestBody @Validated VisitFieldsDto visitDto) {
         Visit currentVisit = visitRepository.findById(visitId).orElseThrow();
+        VisitDateValidator.validate(visitDto.getDate(), currentVisit.getPet());
         currentVisit.setDate(visitDto.getDate());
         currentVisit.setDescription(visitDto.getDescription());
         visitRepository.save(currentVisit);

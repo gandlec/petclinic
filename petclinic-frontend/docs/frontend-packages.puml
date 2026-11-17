@@ -61,6 +61,10 @@ arrow {
 
 [pets] --> [design-system]
 [vets] --> [design-system]
+[owners] --> [design-system]
+[visits] --> [design-system]
+[pettypes] --> [design-system]
+[specialties] --> [design-system]
 
 [owners] --> [generated]
 [pets] --> [generated]

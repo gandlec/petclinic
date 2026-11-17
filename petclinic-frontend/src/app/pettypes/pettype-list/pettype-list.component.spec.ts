@@ -7,6 +7,7 @@ import {CUSTOM_ELEMENTS_SCHEMA} from '@angular/core';
 import {ActivatedRoute, Router} from '@angular/router';
 import {ActivatedRouteStub, RouterStub} from '../../testing/router-stubs';
 import {FormsModule} from '@angular/forms';
+import {DesignSystemModule} from '../../design-system/design-system.module';
 import {Observable, of} from 'rxjs/index';
 import Spy = jasmine.Spy;
 
@@ -32,7 +33,7 @@ describe('PettypeListComponent', () => {
     TestBed.configureTestingModule({
       declarations: [ PettypeListComponent ],
       schemas: [CUSTOM_ELEMENTS_SCHEMA],
-      imports: [FormsModule],
+      imports: [FormsModule, DesignSystemModule],
       providers: [
         {provide: PetTypeService, useClass: PetTypeServiceStub},
         {provide: Router, useClass: RouterStub},

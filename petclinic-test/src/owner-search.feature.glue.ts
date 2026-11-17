@@ -47,8 +47,7 @@ When('I open the owners page', async function (this: PlaywrightWorld) {
 });
 
 When('I search owners for {string}', async function (this: PlaywrightWorld, search: string) {
-  await this.page.locator('#lastName').fill(search);
-  await this.page.locator('#search-owner-form button[type="submit"]').click();
+  await this.page.getByRole('searchbox', {name: 'Filter', exact: true}).fill(search);
 });
 
 Then('exactly these owners are listed: {string}', async function (this: PlaywrightWorld, owners: string) {
@@ -56,5 +55,16 @@ Then('exactly these owners are listed: {string}', async function (this: Playwrig
 });
 
 Then('every owner in the clinic is listed', async function (this: PlaywrightWorld) {
-  await expectOwnersListed(this, this.requireAllOwnerNames());
+  const expected = this.requireAllOwnerNames();
+  const names: string[] = [];
+  const cells = this.page.locator('#ownersTable td.ownerFullName');
+  const next = this.page.getByRole('button', {name: 'Next', exact: true});
+  await expect(this.page.getByLabel('Rows per page')).toBeVisible();
+  await expect.poll(async () => cells.count()).toBe(Math.min(5, expected.length));
+  while (true) {
+    names.push(...(await cells.allTextContents()).map(name => name.trim()));
+    if (await next.isDisabled()) break;
+    await next.click();
+  }
+  expect(names.sort()).toEqual([...expected].sort());
 });

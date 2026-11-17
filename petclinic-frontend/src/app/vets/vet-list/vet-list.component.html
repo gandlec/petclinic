@@ -2,6 +2,7 @@
   <div class="container xd-container">
 
     <h2>Veterinarians</h2>
+    <app-table-filter #filter></app-table-filter>
 
     <table id="vets" class="table table-striped">
       <thead>
@@ -13,7 +14,7 @@
       </tr>
       </thead>
       <tbody>
-      <tr *ngFor="let vet of vets">
+      <tr *ngFor="let vet of vets | tableFilter: filter.query : ['firstName', 'lastName', 'specialties.name']">
         <td>
           {{ vet.firstName }} {{ vet.lastName }}
         </td>

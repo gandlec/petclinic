@@ -57,6 +57,10 @@ binary, :3200 + OTLP :4318): no dashboards, but everything the sequence diagrams
 - App UI: http://localhost:4200 
 - Backend Swagger: http://localhost:8080/swagger-ui.html
 
+List tables have a live **Filter** that matches case-insensitive substrings across
+their displayed data columns, including pet names and specialties. Clear it to
+restore all rows; filtering runs locally without another server request.
+
 ## Prompts to try
 
 Tell an agent running in this repo:
@@ -71,6 +75,7 @@ Tell an agent running in this repo:
 - **Create a skill** — move `### Java Code Style` from AGENTS.md into a `java-code-style/SKILL.md`. Test it activates ±eval on 3 runs.
 - **Turn skill into rule**: Turn the Java Code Style skill you extracted into a .claude/rules/java-rule.md that is loaded 100% before any .java file is edited.
 - **Hooks** – create a hook that plays a sound when the agent finished its turn or waits for your answer/approval.
+
 - **Scripted guardrail** – remove the rule about < 120 chars and try to manually violate it
 
 ### Petclinic Tasks

@@ -1,6 +1,7 @@
 <div class="container-fluid">
   <div class="container xd-container">
     <h2>Visits</h2>
+    <app-table-filter #filter></app-table-filter>
 
     <div *ngIf="isDataReceived && visits.length === 0" class="no-visits">
       No visits found.
@@ -17,7 +18,7 @@
         </tr>
         </thead>
         <tbody>
-        <tr *ngFor="let visit of visits">
+        <tr *ngFor="let visit of visits | tableFilter: filter.query : ['date', 'description', 'petName', 'ownerFirstName', 'ownerLastName']">
           <td class="visit-date">{{ visit.date }}</td>
           <td class="visit-description">{{ visit.description }}</td>
           <td class="visit-pet">{{ visit.petName }}</td>

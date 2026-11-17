@@ -3,6 +3,7 @@ import {NO_ERRORS_SCHEMA} from '@angular/core';
 import {Observable, of} from 'rxjs';
 import {RouterTestingModule} from '@angular/router/testing';
 import {CommonModule} from '@angular/common';
+import {DesignSystemModule} from '../../design-system/design-system.module';
 import {By} from '@angular/platform-browser';
 
 import {VisitsPageComponent} from './visits-page.component';
@@ -39,7 +40,7 @@ describe('VisitsPageComponent', () => {
     TestBed.configureTestingModule({
       declarations: [VisitsPageComponent],
       schemas: [NO_ERRORS_SCHEMA],
-      imports: [CommonModule, RouterTestingModule],
+      imports: [CommonModule, RouterTestingModule, DesignSystemModule],
       providers: [{provide: VisitService, useClass: VisitServiceStub}],
     }).compileComponents();
   }));

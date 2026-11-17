@@ -3,7 +3,7 @@ import {test, expect, Page} from './support/trace-fixture';
 // The owner flows that only a browser can walk, and until now none of them did:
 // every other acceptance test READS owners — the list, a detail page, the visit form
 // hanging off it — so OwnerRestController's whole write side (`addOwner`, `updateOwner`,
-// the search branch of `listOwners`, `getOwner` by id) was code the unit suite called
+// `getOwner` by id) was code the unit suite called
 // and the browser never reached. That gap is exactly what the city's "acceptance reach"
 // colour is for, and these are what close it.
 //
@@ -36,8 +36,7 @@ async function addOwnerThroughTheForm(page: Page, lastName: string): Promise<voi
 
 /** Finds the owner just created and opens their page — which is `getOwner` by id. */
 async function openTheOwnerNamed(page: Page, lastName: string): Promise<void> {
-  await page.fill('#lastName', lastName);
-  await page.locator('button:has-text("Find Owner")').click();
+  await page.getByRole('searchbox', {name: 'Filter', exact: true}).fill(lastName);
   const rows = page.locator('td.ownerFullName');
   await expect(rows).toHaveCount(1);
   await rows.first().locator('a').click();
@@ -49,8 +48,7 @@ test('adds an owner from the New Owner form and finds them by last name', async 
 
   await addOwnerThroughTheForm(page, lastName);
 
-  await page.fill('#lastName', lastName);
-  await page.locator('button:has-text("Find Owner")').click();
+  await page.getByRole('searchbox', {name: 'Filter', exact: true}).fill(lastName);
   const rows = page.locator('td.ownerFullName');
   await expect(rows).toHaveCount(1);
   await expect(rows.first()).toContainText(`Ada ${lastName}`);

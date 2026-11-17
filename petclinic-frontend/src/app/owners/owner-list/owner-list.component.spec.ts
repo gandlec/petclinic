@@ -9,6 +9,7 @@ import {FormsModule} from '@angular/forms';
 import {ActivatedRoute} from '@angular/router';
 import { OwnerService } from '../owner.service';
 import {Owner} from '../owner';
+import {OwnerPage, OwnerPageQuery} from '../owner-page';
 import {Observable, of, Subject} from 'rxjs';
 import {RouterTestingModule} from '@angular/router/testing';
 import {CommonModule} from '@angular/common';
@@ -23,11 +24,11 @@ import Spy = jasmine.Spy;
 
 
 class OwnerServiceStub {
-  getOwners(): Observable<Owner[]> {
-    return of();
+  getOwnersPage(query: OwnerPageQuery): Observable<OwnerPage> {
+    return of({items: [], total: 0});
   }
 
-  searchOwners(lastName: string): Observable<Owner[]> {
+  searchOwners(search: string): Observable<Owner[]> {
     return of();
   }
 }
@@ -37,7 +38,7 @@ describe('OwnerListComponent', () => {
   let component: OwnerListComponent;
   let fixture: ComponentFixture<OwnerListComponent>;
   let ownerService = new OwnerServiceStub();
-  let getOwnersSpy: Spy;
+  let getOwnersPageSpy: Spy;
   let searchOwnersSpy: Spy;
   let de: DebugElement;
   let el: HTMLElement;
@@ -79,8 +80,8 @@ describe('OwnerListComponent', () => {
     fixture = TestBed.createComponent(OwnerListComponent);
     component = fixture.componentInstance;
     ownerService = fixture.debugElement.injector.get(OwnerService);
-    getOwnersSpy = spyOn(ownerService, 'getOwners')
-      .and.returnValue(of(testOwners));
+    getOwnersPageSpy = spyOn(ownerService, 'getOwnersPage')
+      .and.returnValue(of({items: testOwners, total: testOwners.length}));
     searchOwnersSpy = spyOn(ownerService, 'searchOwners')
       .and.returnValue(of(testOwners));
 
@@ -92,7 +93,13 @@ describe('OwnerListComponent', () => {
 
   it('should call ngOnInit() method', () => {
     fixture.detectChanges();
-    expect(getOwnersSpy.calls.any()).toBe(true, 'getOwners called');
+    expect(getOwnersPageSpy).toHaveBeenCalledWith({
+      search: '',
+      page: 0,
+      size: 10,
+      sort: 'name',
+      direction: 'ascending'
+    });
   });
 
 
@@ -106,37 +113,96 @@ describe('OwnerListComponent', () => {
     });
   }));
 
-  it('searchByLastName should call getOwners for empty term', () => {
-    getOwnersSpy.calls.reset();
-    searchOwnersSpy.calls.reset();
+  function filterFor(query: string) {
+    const input: HTMLInputElement = fixture.nativeElement.querySelector('input[type="search"]');
+    input.value = query;
+    input.dispatchEvent(new Event('input'));
+    fixture.detectChanges();
+  }
 
-    component.searchByLastName('');
+  function listedNames(): string[] {
+    return fixture.debugElement.queryAll(By.css('.ownerFullName'))
+      .map(cell => cell.nativeElement.textContent.trim());
+  }
 
-    expect(getOwnersSpy).toHaveBeenCalled();
+  it('sends live search to the server and resets to the first page', () => {
+    getOwnersPageSpy.and.returnValue(of({items: [testOwner], total: 1}));
+    fixture.detectChanges();
+    component.pageIndex = 2;
+
+    filterFor('george FRANKLIN');
+
+    expect(getOwnersPageSpy.calls.mostRecent().args[0]).toEqual({
+      search: 'george FRANKLIN',
+      page: 0,
+      size: 10,
+      sort: 'name',
+      direction: 'ascending'
+    });
+    expect(listedNames()).toEqual(['George Franklin']);
     expect(searchOwnersSpy).not.toHaveBeenCalled();
   });
 
-  it('searchByLastName should call searchOwners for non-empty term', () => {
-    getOwnersSpy.calls.reset();
-    searchOwnersSpy.calls.reset();
-
-    component.searchByLastName('Fr');
-
-    expect(searchOwnersSpy).toHaveBeenCalledWith('Fr');
-    expect(getOwnersSpy).not.toHaveBeenCalled();
-  });
-
-  // The page loads every owner on open; a search typed before that answer arrives must
-  // not be overwritten by it when it finally does.
-  it('a search is not overwritten by the initial load answering late', () => {
-    const initialLoad = new Subject<Owner[]>();
-    getOwnersSpy.and.returnValue(initialLoad);
+  it('ignores a stale page response after the search changes', () => {
+    const initialLoad = new Subject<OwnerPage>();
+    getOwnersPageSpy.and.returnValues(initialLoad, of({items: [testOwner], total: 1}));
     fixture.detectChanges();
 
-    component.searchByLastName('Franklin');
-    initialLoad.next([testOwner, {...testOwner, id: 2, lastName: 'Davis'}]);
+    filterFor('Franklin');
+    initialLoad.next({items: [testOwner, {...testOwner, id: 2, lastName: 'Davis'}], total: 2});
+    fixture.detectChanges();
+    expect(listedNames()).toEqual(['George Franklin']);
+  });
 
-    expect(component.owners).toEqual([testOwner]);
+  it('paginates server results and resets when the page size changes', () => {
+    const allOwners = Array.from({length: 23}, (_, i) =>
+      ({...testOwner, id: i + 1, firstName: `Owner ${String(i + 1).padStart(2, '0')}`}));
+    getOwnersPageSpy.and.callFake((query: OwnerPageQuery) => of({
+      items: allOwners.slice(query.page * query.size, (query.page + 1) * query.size),
+      total: allOwners.length
+    }));
+    fixture.detectChanges();
+
+    expect(listedNames().length).toBe(10);
+    component.nextPage();
+    fixture.detectChanges();
+    expect(listedNames()[0]).toBe('Owner 11 Franklin');
+
+    component.setPageSize(5);
+    fixture.detectChanges();
+    expect(component.pageIndex).toBe(0);
+    expect(listedNames().length).toBe(5);
+    component.setPageSize(20);
+    fixture.detectChanges();
+    expect(listedNames().length).toBe(20);
+    component.nextPage();
+    fixture.detectChanges();
+    expect(listedNames().length).toBe(3);
+    component.nextPage();
+    expect(component.pageIndex).toBe(1);
+    component.previousPage();
+    expect(component.pageIndex).toBe(0);
+  });
+
+  it('requests server sorting for every column and direction', () => {
+    getOwnersPageSpy.and.returnValue(of({items: [testOwner], total: 1}));
+    fixture.detectChanges();
+    for (const column of ['name', 'address', 'city', 'telephone', 'pets']) {
+      const header: HTMLButtonElement = fixture.nativeElement.querySelector(`button[data-sort="${column}"]`);
+      header.click();
+      fixture.detectChanges();
+      expect(getOwnersPageSpy.calls.mostRecent().args[0]).toEqual({
+        search: '',
+        page: 0,
+        size: 10,
+        sort: column,
+        direction: column === 'name' ? 'descending' : 'ascending'
+      });
+      header.click();
+      fixture.detectChanges();
+      expect(getOwnersPageSpy.calls.mostRecent().args[0].direction)
+        .toBe(column === 'name' ? 'ascending' : 'descending');
+    }
   });
 
 });

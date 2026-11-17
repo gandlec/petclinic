@@ -7,9 +7,11 @@ import {SpecialtiesRoutingModule} from './specialties-routing.module';
 import {SpecialtyAddComponent} from './specialty-add/specialty-add.component';
 import {SpecialtyEditComponent} from './specialty-edit/specialty-edit.component';
 import {SpecResolver} from './spec-resolver';
+import {DesignSystemModule} from '../design-system/design-system.module';
 
 @NgModule({
   imports: [
+    DesignSystemModule,
     CommonModule,
     FormsModule,
     SpecialtiesRoutingModule

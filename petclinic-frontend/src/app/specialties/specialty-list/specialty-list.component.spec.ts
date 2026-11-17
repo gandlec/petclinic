@@ -5,6 +5,7 @@ import {CUSTOM_ELEMENTS_SCHEMA} from '@angular/core';
 
 import {SpecialtyListComponent} from './specialty-list.component';
 import {FormsModule} from '@angular/forms';
+import {DesignSystemModule} from '../../design-system/design-system.module';
 import {SpecialtyService} from '../specialty.service';
 import {Specialty} from '../specialty';
 import {ActivatedRoute, Router} from '@angular/router';
@@ -34,7 +35,7 @@ describe('SpecialtyListComponent', () => {
     TestBed.configureTestingModule({
       declarations: [SpecialtyListComponent],
       schemas: [CUSTOM_ELEMENTS_SCHEMA],
-      imports: [FormsModule],
+      imports: [FormsModule, DesignSystemModule],
       providers: [
         {provide: SpecialtyService, useClass: SpecialityServiceStub},
         {provide: Router, useClass: RouterStub},

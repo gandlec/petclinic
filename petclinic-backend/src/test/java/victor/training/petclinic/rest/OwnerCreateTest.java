@@ -100,7 +100,9 @@ class OwnerCreateTest {
                 .andExpect(status().isCreated())
                 .andExpect(header().exists("Location"));
 
-        assertThat(ownerRepository.findByLastNameStartingWith("Tesla")).isNotEmpty();
+        assertThat(ownerRepository.findAll())
+                .extracting(Owner::getLastName)
+                .contains("Tesla");
     }
 
     @Test

@@ -1,0 +1,290 @@
+package victor.training.petclinic.rest;
+
+import java.net.URI;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Objects;
+import java.util.Set;
+import java.util.stream.Collectors;
+
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.server.ResponseStatusException;
+import victor.training.petclinic.mapper.OwnerMapper;
+import victor.training.petclinic.mapper.PetMapper;
+import victor.training.petclinic.mapper.VisitMapper;
+import victor.training.petclinic.domain.Owner;
+import victor.training.petclinic.domain.Pet;
+import victor.training.petclinic.domain.Visit;
+import victor.training.petclinic.notification.NotificationSender;
+import victor.training.petclinic.repository.OwnerRepository;
+import victor.training.petclinic.repository.PetRepository;
+import victor.training.petclinic.repository.PetTypeRepository;
+import victor.training.petclinic.repository.VisitRepository;
+import victor.training.petclinic.rest.dto.OwnerDto;
+import victor.training.petclinic.rest.dto.OwnerFieldsDto;
+import victor.training.petclinic.rest.dto.OwnerPageDto;
+import victor.training.petclinic.rest.dto.PetDto;
+import victor.training.petclinic.rest.dto.PetFieldsDto;
+import victor.training.petclinic.rest.dto.VisitFieldsDto;
+import org.springframework.security.access.prepost.PreAuthorize;
+import org.springframework.validation.annotation.Validated;
+import org.springframework.web.bind.annotation.DeleteMapping;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.PutMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.util.UriComponents;
+import org.springframework.web.util.UriComponentsBuilder;
+
+import io.opentelemetry.instrumentation.annotations.WithSpan;
+import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.media.ArraySchema;
+import io.swagger.v3.oas.annotations.media.Content;
+import io.swagger.v3.oas.annotations.media.ExampleObject;
+import io.swagger.v3.oas.annotations.media.Schema;
+import io.swagger.v3.oas.annotations.responses.ApiResponse;
+import jakarta.transaction.Transactional;
+
+@RestController
+@RequestMapping("/api/owners")
+@PreAuthorize("hasRole(@roles.OWNER_ADMIN)")
+public class OwnerRestController {
+
+    private final OwnerRepository ownerRepository;
+    private final PetRepository petRepository;
+    private final VisitRepository visitRepository;
+    private final PetTypeRepository petTypeRepository;
+
+    private final OwnerMapper ownerMapper;
+
+    private final PetMapper petMapper;
+
+    private final VisitMapper visitMapper;
+
+    private final NotificationSender notificationSender;
+
+    public OwnerRestController(
+            OwnerRepository ownerRepository,
+            PetRepository petRepository,
+            VisitRepository visitRepository,
+            PetTypeRepository petTypeRepository,
+            OwnerMapper ownerMapper,
+            PetMapper petMapper,
+            VisitMapper visitMapper,
+            NotificationSender notificationSender) {
+        this.ownerRepository = ownerRepository;
+        this.petRepository = petRepository;
+        this.visitRepository = visitRepository;
+        this.petTypeRepository = petTypeRepository;
+        this.ownerMapper = ownerMapper;
+        this.petMapper = petMapper;
+        this.visitMapper = visitMapper;
+        this.notificationSender = notificationSender;
+    }
+
+    @Operation(operationId = "listOwners", summary = "List owners")
+    @ApiResponse(responseCode = "200", description = "OK",
+            content = @Content(mediaType = "application/json",
+                    array = @ArraySchema(schema = @Schema(implementation = OwnerDto.class)),
+                    examples = @ExampleObject(name = "sample", value = ApiExamples.OWNERS)))
+    @GetMapping(produces = "application/json")
+    public List<OwnerDto> listOwners(@RequestParam(name = "search", defaultValue = "") String search) {
+        return ownerMapper.toOwnerDtoCollection(matchingOwners(search));
+    }
+
+    @Operation(operationId = "listOwnersPage", summary = "List a page of owners")
+    @GetMapping(path = "/page", produces = "application/json")
+    public OwnerPageDto listOwnersPage(
+            @RequestParam(name = "search", defaultValue = "") String search,
+            @RequestParam(name = "page", defaultValue = "0") int page,
+            @RequestParam(name = "size", defaultValue = "10") int size,
+            @RequestParam(name = "sort", defaultValue = "name") String sort,
+            @RequestParam(name = "direction", defaultValue = "ascending") String direction) {
+        validatePageRequest(page, size, sort, direction);
+        List<Owner> matching = matchingOwners(search);
+        matching.sort(ownerComparator(sort, direction));
+
+        long start = (long) page * size;
+        List<OwnerDto> items = start >= matching.size() ? List.of()
+                : ownerMapper.toOwnerDtoCollection(matching.subList((int) start,
+                        (int) Math.min(start + size, matching.size())));
+        return new OwnerPageDto(items, matching.size());
+    }
+
+    private void validatePageRequest(int page, int size, String sort, String direction) {
+        if (page < 0 || !Set.of(5, 10, 20).contains(size)
+                || !Set.of("name", "address", "city", "telephone", "pets").contains(sort)
+                || !Set.of("ascending", "descending").contains(direction)) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Invalid Owners page request");
+        }
+    }
+
+    private List<Owner> matchingOwners(String search) {
+        List<Owner> owners = ownerRepository.findAll();
+        List<Owner> matching = search.isBlank() ? owners
+                : owners.stream().filter(owner -> matchesSearch(owner, search)).toList();
+        return new ArrayList<>(matching);
+    }
+
+    private Comparator<Owner> ownerComparator(String sort, String direction) {
+        Comparator<Owner> byColumn = Comparator.comparing(owner -> sortValue(owner, sort),
+                String.CASE_INSENSITIVE_ORDER);
+        if ("descending".equals(direction)) {
+            byColumn = byColumn.reversed();
+        }
+        return byColumn.thenComparing(Owner::getId);
+    }
+
+    private String sortValue(Owner owner, String sort) {
+        return switch (sort) {
+            case "name" -> owner.getFirstName() + " " + owner.getLastName();
+            case "address" -> Objects.toString(owner.getAddress(), "");
+            case "city" -> Objects.toString(owner.getCity(), "");
+            case "telephone" -> Objects.toString(owner.getTelephone(), "");
+            case "pets" -> owner.getPets().stream()
+                    .map(pet -> Objects.toString(pet.getName(), ""))
+                    .sorted(String.CASE_INSENSITIVE_ORDER)
+                    .collect(Collectors.joining(" "));
+            default -> throw new IllegalArgumentException("Unsupported Owners sort column: " + sort);
+        };
+    }
+
+    // Matches any visible column of the owners table — name, address, city, phone, pet
+    // names — case-insensitively and by substring, not just a last-name prefix (issue #24).
+    private boolean matchesSearch(Owner owner, String search) {
+        String needle = search.toLowerCase();
+        return containsIgnoreCase(owner.getFirstName() + " " + owner.getLastName(), needle)
+                || containsIgnoreCase(owner.getAddress(), needle)
+                || containsIgnoreCase(owner.getCity(), needle)
+                || containsIgnoreCase(owner.getTelephone(), needle)
+                || owner.getPets().stream().anyMatch(pet -> containsIgnoreCase(pet.getName(), needle));
+    }
+
+    private boolean containsIgnoreCase(String value, String needleLower) {
+        return value != null && value.toLowerCase().contains(needleLower);
+    }
+
+    @Operation(operationId = "countOwners", summary = "Count owners")
+    @GetMapping("/count")
+    @PreAuthorize("permitAll()")
+    public long countOwners() {
+        return ownerRepository.count();
+    }
+
+    @Operation(operationId = "getOwner", summary = "Get an owner by ID")
+    @GetMapping("/{ownerId}")
+    public OwnerDto getOwner(@PathVariable int ownerId) {
+        Owner owner = ownerRepository.findById(ownerId).orElseThrow();
+        return ownerMapper.toOwnerDto(owner);
+    }
+
+    @Operation(operationId = "addOwner", summary = "Create an owner")
+    @PostMapping(consumes = "application/json")
+    public ResponseEntity<Void> addOwner(@RequestBody @Validated OwnerFieldsDto ownerFieldsDto) {
+        Owner owner = ownerMapper.toOwner(ownerFieldsDto);
+        ownerRepository.save(owner);
+        URI createdUri = UriComponentsBuilder.newInstance()
+                .path("/api/owners/{id}").buildAndExpand(owner.getId()).toUri();
+        return ResponseEntity.created(createdUri).build();
+    }
+
+    @Operation(operationId = "updateOwner", summary = "Update an owner")
+    @PutMapping("/{ownerId}")
+    public void updateOwner(@PathVariable int ownerId, @RequestBody @Validated OwnerFieldsDto ownerFieldsDto) {
+        Owner currentOwner = ownerRepository.findById(ownerId).orElseThrow();
+        currentOwner.setAddress(ownerFieldsDto.getAddress());
+        currentOwner.setCity(ownerFieldsDto.getCity());
+        currentOwner.setFirstName(ownerFieldsDto.getFirstName());
+        currentOwner.setLastName(ownerFieldsDto.getLastName());
+        currentOwner.setTelephone(ownerFieldsDto.getTelephone());
+        ownerRepository.save(currentOwner);
+    }
+
+    @Operation(operationId = "deleteOwner", summary = "Delete an owner by ID")
+    @DeleteMapping("/{ownerId}")
+    public void deleteOwner(@PathVariable int ownerId) {
+        Owner owner = ownerRepository.findById(ownerId).orElseThrow();
+        ownerRepository.delete(owner);
+    }
+
+    @Operation(operationId = "addPetToOwner", summary = "Add a pet to an owner")
+    @PostMapping("{ownerId}/pets")
+    @Transactional
+    public ResponseEntity<Void> addPetToOwner(@PathVariable int ownerId,
+            @RequestBody @Validated PetFieldsDto petFieldsDto) {
+        Pet pet = petMapper.toPet(petFieldsDto);
+        Owner owner = new Owner();
+        owner.setId(ownerId);
+        pet.setOwner(owner);
+        pet.setType(petTypeRepository.findById(pet.getType().getId()).orElseThrow());
+        petRepository.save(pet);
+        UriComponents createdUri = UriComponentsBuilder.newInstance().path("/api/pets/{id}")
+                .buildAndExpand(pet.getId());
+        return ResponseEntity.created(createdUri.toUri()).build();
+    }
+
+    @Operation(operationId = "updateOwnersPet", summary = "Update an owner's pet")
+    @PutMapping("{ownerId}/pets/{petId}")
+    @Transactional
+    public void updateOwnersPet(@PathVariable int ownerId, @PathVariable int petId,
+            @RequestBody @Validated PetFieldsDto petFieldsDto) {
+        Pet currentPet = petRepository.findById(petId).orElseThrow();
+        currentPet.setBirthDate(petFieldsDto.getBirthDate());
+        currentPet.setName(petFieldsDto.getName());
+        currentPet.setType(petTypeRepository.findById(petFieldsDto.getType().getId()).orElseThrow());
+        petRepository.save(currentPet);
+    }
+
+    @Operation(operationId = "addVisitToOwner", summary = "Add a visit for an owner's pet")
+    @PostMapping("{ownerId}/pets/{petId}/visits")
+    public ResponseEntity<Void> addVisitToOwner(@PathVariable int ownerId, @PathVariable int petId,
+            @RequestBody @Validated VisitFieldsDto visitFieldsDto) {
+        Pet pet = petRepository.findById(petId).orElseThrow();
+        VisitDateValidator.validate(visitFieldsDto.getDate(), pet);
+        int visitId = bookVisit(ownerId, petId, visitFieldsDto);
+
+        URI createdUri = UriComponentsBuilder.fromPath("/api/pets/{petId}/visits/{id}")
+                .buildAndExpand(petId, visitId).toUri();
+        return ResponseEntity.created(createdUri).build();
+    }
+
+    // Explicit span so the booking step shows up in the Tempo trace — and in the sequence
+    // diagram generated from it — beside the auto-instrumented SERVER and JDBC spans, which
+    // on their own say "a POST happened, an INSERT happened" and never name the step.
+    // The OTel Java agent instruments @WithSpan at the bytecode level, so it works on a
+    // private, self-invoked method (Spring AOP would not) — keeping the repository-only,
+    // no-service-layer house style.
+    @WithSpan("book-visit")
+    private int bookVisit(int ownerId, int petId, VisitFieldsDto visitFieldsDto) {
+        Visit visit = visitMapper.toVisit(visitFieldsDto);
+        Pet pet = new Pet();
+        pet.setId(petId);
+        visit.setPet(pet);
+        visitRepository.save(visit);
+        notifyOwner(ownerId, petId, visit);
+        return visit.getId();
+    }
+
+    // After the insert, never before: a booking that could not be saved is a text nobody
+    // should have received. The owner is loaded here, not in notification-service — which
+    // then needs no copy of our database.
+    private void notifyOwner(int ownerId, int petId, Visit visit) {
+        Owner owner = ownerRepository.findById(ownerId).orElseThrow();
+        String petName = owner.getPetById(petId).map(Pet::getName).orElse("your pet");
+        notificationSender.visitBooked(owner.getTelephone(), petName, visit.getDate());
+    }
+
+    @Operation(operationId = "getOwnersPet", summary = "Get a pet belonging to an owner")
+    @GetMapping("{ownerId}/pets/{petId}")
+    public PetDto getOwnersPet(@PathVariable int ownerId, @PathVariable int petId) {
+        Owner owner = ownerRepository.findById(ownerId).orElseThrow();
+        Pet pet = owner.getPetById(petId).orElseThrow();
+        return petMapper.toPetDto(pet);
+    }
+}

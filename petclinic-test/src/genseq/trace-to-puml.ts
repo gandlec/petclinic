@@ -1,0 +1,811 @@
+import {formatOriginLabel, formatSqlDetail, formatSqlLabel, splitOrigin, summarizeStatement} from './sql-label';
+import {formatJsonDetail, jsonNote} from './json-label';
+import {DEFAULT_DIAGRAM_OPTIONS, DiagramOptions} from './options';
+import {DetailCollector, DetailEntry, DetailIndex, DetailStep} from './detail-index';
+import {OperationNames, defaultOperations, operationNameOf} from './openapi-operations';
+import {linkedSectionTitle} from './test-location';
+import {METHOD_LINK_MARKER, linkedMethodLabel} from './code-location';
+import {CALL_SITE_ATTRIBUTE} from './call-site';
+import {recordedRequest, requestMessage} from './http-request';
+
+export interface NormSpan {
+  traceId: string;
+  spanId: string;
+  parentSpanId: string;
+  name: string;
+  kind: string;
+  serviceName: string;
+  startNano: number;
+  attributes: Record<string, string>;
+}
+
+const KIND_BY_NUMBER: Record<number, string> = {
+  0: 'UNSPECIFIED', 1: 'INTERNAL', 2: 'SERVER', 3: 'CLIENT', 4: 'PRODUCER', 5: 'CONSUMER',
+};
+
+function normKind(kind: unknown): string {
+  if (typeof kind === 'number') return KIND_BY_NUMBER[kind] ?? 'UNSPECIFIED';
+  if (typeof kind === 'string') return kind.replace('SPAN_KIND_', '') || 'UNSPECIFIED';
+  return 'UNSPECIFIED';
+}
+
+function attrValue(v: any): string {
+  if (v == null) return '';
+  return String(
+    v.stringValue ?? v.intValue ?? v.boolValue ?? v.doubleValue ?? '',
+  );
+}
+
+function attrsToMap(attrs: any[] = []): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const a of attrs) out[a.key] = attrValue(a.value);
+  return out;
+}
+
+export function parseTempoTrace(tempoJson: any): NormSpan[] {
+  const spans: NormSpan[] = [];
+  for (const batch of tempoJson?.batches ?? []) {
+    const resourceAttrs = attrsToMap(batch?.resource?.attributes);
+    const serviceName = resourceAttrs['service.name'] ?? 'unknown';
+    const scopes = batch?.scopeSpans ?? batch?.instrumentationLibrarySpans ?? [];
+    for (const scope of scopes) {
+      for (const s of scope?.spans ?? []) {
+        spans.push({
+          traceId: s.traceId ?? '',
+          spanId: s.spanId ?? '',
+          parentSpanId: s.parentSpanId ?? '',
+          name: s.name ?? '',
+          kind: normKind(s.kind),
+          serviceName,
+          startNano: Number(s.startTimeUnixNano ?? 0),
+          attributes: attrsToMap(s.attributes),
+        });
+      }
+    }
+  }
+  return spans;
+}
+
+const DB_NAME_RE = /^(SELECT|INSERT|UPDATE|DELETE|MERGE)\b/i;
+
+// A span may name its own lifeline. Nothing in a trace otherwise separates the test
+// from the code it drives when both run in one JVM: a @SpringBootTest's MockMvc call and
+// the controller it reaches carry the same `service.name`, so without this they collapse
+// onto one participant and the picture loses the only hop it was drawn to show.
+// Set by petclinic-backend's genseq/Steps.java; the two are one contract.
+export const PARTICIPANT_ATTRIBUTE = 'genseq.participant';
+
+/** What kind of thing a declared lifeline is — `module`, for a jar linked into the services. */
+export const STEREOTYPE_ATTRIBUTE = 'genseq.stereotype';
+
+/** The lifeline a @SpringBootTest's own `given`/`when`/`then` marks are drawn on. */
+export const TEST_PARTICIPANT = 'Test';
+
+function participantOf(span: NormSpan): string {
+  const declared = span.attributes[PARTICIPANT_ATTRIBUTE]?.trim();
+  if (declared) return declared;
+  if (span.serviceName === 'petclinic-frontend') return 'Browser';
+  // both the old and the stable database semconv, since the agent can emit either
+  const isDb = ['db.system', 'db.system.name', 'db.statement', 'db.query.text']
+    .some((key) => key in span.attributes) || DB_NAME_RE.test(span.name);
+  if (span.kind === 'CLIENT' && isDb) return 'DB';
+  if (span.serviceName === 'petclinic-backend') return 'Backend';
+  if (span.serviceName === 'notification-service') return 'NotificationService';
+  return span.serviceName || 'unknown';
+}
+
+// `db.statement` is the OTel agent's SQL; `db.query.text` is the same thing
+// under the stable database semconv, emitted once the agent opts in.
+function sqlOf(span: NormSpan): string | undefined {
+  const sql = span.attributes['db.statement'] ?? span.attributes['db.query.text'];
+  return sql?.trim() || undefined;
+}
+
+/**
+ * True for a DB span the driver opened without a statement to run.
+ *
+ * The JDBC instrumentation times every call *into the driver*, not only the ones that carry
+ * SQL: borrowing and validating a pooled connection, `setAutoCommit`, the liveness check a
+ * pool fires between borrows. Those arrive as CLIENT spans named after the database rather
+ * than after a statement (`petclinic`), wearing the whole database semconv —
+ *
+ *     {"db.system": "postgresql", "db.name": "petclinic", "db.namespace": "petclinic",
+ *      "db.connection_string": "postgresql://localhost:5433", "server.address": "localhost",
+ *      "server.port": "5433", "db.user": "petclinic", "thread.name": "http-nio-8081-exec-9",
+ *      "db.statement": "", "db.query.text": ""}
+ *
+ * — with both statement attributes *present and empty*. (Seven of them in the span cache of
+ * a full run, `test-results/trace-spans.json`: three inside one add-visit scenario, one in
+ * owner-search; each a leaf under `OwnerRepository.findById`, `VetRepository.findAll` or
+ * `Hibernate Query`.)
+ *
+ * They draw as `Backend -> DB: petclinic`: an arrow that names no call, hides no statement
+ * behind its `⊕`, and repeats whatever query is drawn next to it. So the diagram drops them.
+ *
+ * A DB span whose *name* is a statement (`SELECT petclinic.owners`) is kept even with no
+ * statement text — that is a real query recorded by an agent that was not asked to capture
+ * the SQL, and the name is the label the arrow has always carried.
+ */
+function isStatementlessDbSpan(span: NormSpan): boolean {
+  return sqlOf(span) === undefined && !DB_NAME_RE.test(span.name);
+}
+
+const PARAMETER_KEY_RE = /^db\.query\.parameter\.(\d+)$/;
+
+/** The bound values, in placeholder order — captured only when the agent is asked to. */
+function parametersOf(span: NormSpan): string[] {
+  return Object.entries(span.attributes)
+    .map(([key, value]) => ({index: PARAMETER_KEY_RE.exec(key)?.[1], value}))
+    .filter((p): p is {index: string; value: string} => p.index !== undefined)
+    .sort((a, b) => Number(a.index) - Number(b.index))
+    .map((p) => p.value);
+}
+
+// Hibernate writes a placeholder instead of query text when there was no query text to
+// write: a Spring Data *derived* method is assembled through the Criteria API, so its
+// comment reads `/* <criteria> */`. That names the mechanism, never the call.
+const ORIGIN_PLACEHOLDER = /^<[a-z]+>$/i;
+
+// `Session.find victor.training.petclinic.domain.Owner` — the package is the same for
+// every domain class in the trace, so it is nine words of nothing on an arrow.
+const QUALIFIED_NAME = /\b(?:[a-z][\w$]*\.)+([A-Z][\w$]*)/g;
+
+function unqualify(name: string): string {
+  return name.replace(QUALIFIED_NAME, '$1');
+}
+
+/**
+ * What the arrow into this span says. For a DB hop that is the *call* the query came
+ * from, not the query — which is the grain a reviewer reads a sequence diagram at, and
+ * the one thing `SELECT petclinic`, repeated twenty times down an N+1, cannot tell them.
+ * The SQL stays one click away.
+ *
+ * Three sources, best first, because no single one covers every query:
+ *
+ *   1. Hibernate's own comment on the statement (`hibernate.use_sql_comments`) — the
+ *      real HQL, but only for a query written as HQL: an `@Query` method.
+ *   2. the Spring Data repository method above it — what a derived method has instead of
+ *      HQL, since Hibernate only says `<criteria>` for those;
+ *   3. the Hibernate session call above it — `Session.find Owner`, which is what a lazy
+ *      load or a `findById` has instead of either.
+ *
+ * The span name is the last resort and a poor one; it appears when a trace was recorded
+ * without any of the above, e.g. against a backend older than `use_sql_comments`.
+ */
+function arrowLabel(
+  span: NormSpan, target: string, options: DiagramOptions, operations: OperationNames,
+  caller?: string,
+): string {
+  if (target !== 'DB') {
+    // A REST hop's span name is its route; the contract's name for that operation is
+    // the line above it, so the arrow says what the call was for before where it went.
+    const operation = operationNameOf(span.name, operations);
+    return operation ? `${operation}\\n${span.name}` : span.name;
+  }
+  if (options.sql === 'off') return span.name;
+  const sql = sqlOf(span);
+  if (!sql) return span.name;
+  const {origin} = splitOrigin(sql);
+  const spoken = origin && !ORIGIN_PLACEHOLDER.test(origin) ? formatOriginLabel(origin) : undefined;
+  const account = spoken ?? caller ?? summarizeStatement(sql);
+  if (options.interactive) return account ?? span.name;
+  // A baked-in diagram is asked for precisely to have the statement on the page, so it
+  // gets both grains: Hibernate's account, then the SQL it compiled to.
+  // The values go in *after* the statement is folded into clauses — a bound value
+  // reading "Follow up on the vaccination" would otherwise be folded at its own ON.
+  const statement = formatSqlLabel(sql, options.sql === 'values' ? parametersOf(span) : []);
+  return account ? `${account}\\n${statement}` : statement;
+}
+
+// The handle a reader clicks. PlantUML turns `[[scheme://id{tooltip} text]]` into an
+// <a href> around its own <text> run in the SVG, which is a stable, generation-time
+// anchor for the id — nothing downstream has to match rendered label text.
+//
+// The link wraps the whole label *and* keeps the ⊕ inside it. Those answer two different
+// questions: the wrapped label makes the arrow the click target, so a reviewer who wants
+// to click it can aim at the words rather than at a glyph; the ⊕ is what says there is
+// anything to click at all. Drop it and a diagram read outside review.html — a raw .puml,
+// an SVG in a PR — offers no hint that an arrow hides a statement.
+const MARKER_SCHEME = 'genseq://';
+const MARKER_GLYPH = '⊕';
+
+/** `label`, wrapped in the link that reveals `entry` — or bare, when there is nothing to reveal. */
+function linkLabel(
+  label: string, collector: DetailCollector, entry: DetailEntry, tooltip: string,
+): string {
+  if (entry.steps.length === 0) return label;
+  const id = collector.add(entry);
+  return `[[${MARKER_SCHEME}${id}{${tooltip}} ${label} ${MARKER_GLYPH}]]`;
+}
+
+/** The `⊕` on its own, for a label whose words already link somewhere else. */
+function linkMarker(collector: DetailCollector, entry: DetailEntry, tooltip: string): string {
+  return `[[${MARKER_SCHEME}${collector.add(entry)}{${tooltip}} ${MARKER_GLYPH}]]`;
+}
+
+const SQL_TOOLTIP = 'Click for the statement behind this call';
+const BODY_TOOLTIP = 'Click for this call’s JSON body';
+const REQUEST_TOOLTIP = 'Click for the request as it was sent';
+
+/**
+ * One step: the statement as Hibernate sent it. The bound values ride along as the
+ * step's alternate, which the panel offers as a toggle rather than as a second click —
+ * a click that swaps the text under you reads as a bug until you have seen it twice,
+ * and a `1 / 2` counter is not a discoverable way to say "there is more".
+ *
+ * Neither carries a label. "statement as sent — ? for each bound value" described the
+ * toggle's own state, which the toggle already shows, above a block of SQL whose `?`s
+ * are right there to see; the panel's title says which call this is, and that is the
+ * only thing a reader does not already have in front of them.
+ */
+function sqlSteps(span: NormSpan, options: DiagramOptions): DetailStep[] {
+  if (!options.interactive || options.sql === 'off') return [];
+  const sql = sqlOf(span);
+  if (!sql) return [];
+  const parameters = parametersOf(span);
+  return [{
+    label: '',
+    text: formatSqlDetail(sql),
+    ...(parameters.length > 0 ? {
+      alternate: {label: '', text: formatSqlDetail(sql, parameters)},
+    } : {}),
+  }];
+}
+
+/** hidden → the payload of this one call. */
+function bodySteps(
+  body: string | undefined, label: string, options: DiagramOptions,
+): DetailStep[] {
+  if (!options.interactive || !options.httpBodies) return [];
+  const text = formatJsonDetail(body);
+  if (!text) return [];
+  return [{label, text}];
+}
+
+// The browser is where the payloads are captured, so they sit on the frontend
+// CLIENT span — one level up from the backend SERVER span the arrow is drawn from.
+// A service that records its own request body puts it on its SERVER span, the arrow's
+// own; borrowing from a parent that is not a CLIENT would hand that body to every call
+// the handler makes next (`send-sms` showing the notification it was sent).
+function bodyOf(span: NormSpan, parent: NormSpan | undefined, key: string): string | undefined {
+  return span.attributes[key] ?? (parent?.kind === 'CLIENT' ? parent.attributes[key] : undefined);
+}
+
+// Only a meaningful label (e.g. an HTTP status) is worth a return arrow;
+// a bare "return" carries no information, so callers skip the line when undefined.
+function returnLabel(span: NormSpan): string | undefined {
+  return span.attributes['http.status_code']
+    ?? span.attributes['http.response.status_code'];
+}
+
+// The OTel Hibernate instrumentation draws a span for the session call behind every
+// query — `Session.find victor.training.petclinic.domain.Owner`, `Hibernate Query`.
+// Under a Spring Data repository that is the repository method restated in Hibernate's
+// vocabulary: `OwnerRepository.findById` already said it, and the arrow underneath adds
+// a lifeline hop and a nesting level to say it again.
+//
+// They are kept when nothing above them is a repository — that is the case they do
+// carry information for: code using the EntityManager directly, where the session call
+// is the only account of what was asked for.
+const HIBERNATE_SPAN_RE = /^(Session\.\w+|Hibernate Query)\b/;
+const REPOSITORY_SPAN_RE = /Repository\.\w+$/;
+
+// The commit the transaction interceptor issues on the way out. It is emitted as the last
+// child of whatever span opened the transaction, which is what lets the diagram draw the
+// *scope* rather than just the moment: a bare `Transaction.commit` arrow says a
+// transaction ended somewhere above, and leaves the reader to guess how far up.
+const TRANSACTION_COMMIT = 'Transaction.commit';
+
+// How the transaction ended, stamped by the backend's TransactionOutcomeTracing on the span
+// that opened it: `committed`, `rolled back` or `commit failed`. The agent draws a commit as
+// a span of its own (above) but a rollback as nothing at all, so a transaction that rolled
+// back used to get no frame, and a frame could only ever have meant "committed". A trace
+// recorded before the attribute existed still has its commit span, and that says the same.
+export const TRANSACTION_OUTCOME_ATTRIBUTE = 'transaction.outcome';
+const COMMITTED = 'committed';
+
+// The frame's tab says just `tx` — whatever opened it is named by the call it sits inside,
+// so a longer tab would only repeat that. How it ended goes *beside* the tab: PlantUML draws
+// a group's `[bracketed]` tail as a second label to the right of it, in the header's grey
+// (GROUP_TAIL_STYLE) — the expected case, read as a quiet status. Anything but a commit is
+// amber, the case a reader must not skim past; it reads on a light and a dark page as it is.
+function transactionHeader(outcome: string): string {
+  return outcome === COMMITTED
+    ? `group tx [${outcome}]`
+    : `group tx [<color:#B26A00>${outcome}</color>]`;
+}
+
+// The tail's style, for every group: grey and plain where the `tx` tab stays bold. In the
+// header rather than as an inline <color>, which splits `[committed]` into three text runs —
+// and the review page, redrawing labels in its own font, then opens a gap before the `]`.
+// #888888 is that page's muted grey, which it re-themes for dark mode.
+const GROUP_TAIL_STYLE = [
+  'skinparam sequenceGroupFontColor #888888',
+  'skinparam sequenceGroupFontStyle plain',
+];
+
+/** The opt-in a reader will find in the source this diagram was drawn from. */
+function optInOf(source: string): string {
+  return source.endsWith('.java') ? '@GenerateSequence' : '@generate_sequence';
+}
+
+/**
+ * Why this test was traced, as the footer says it. A test GENSEQ_SELECT named carries no
+ * tag: naming one there would send the reader looking for an annotation the file lacks.
+ */
+function provenanceOf(source: string, scenarios: DiagramScenario[]): string {
+  const selected = scenarios.length > 0 && scenarios.every((s) => s.selected);
+  return selected ? 'traced because this branch wrote it' : optInOf(source);
+}
+
+/**
+ * A scenario's heading, qualified by the class it lives in — for Java, and only for Java.
+ *
+ * `remembers the vet who attended it` is a method name read back as a sentence, and a
+ * method name is only half a name: the other half is the class, which is where a Java
+ * reader looks for the scope of what is being tested. On a review page listing every
+ * picture by its heading, two classes can easily each have a `creates one` and neither
+ * line says which endpoint it is about.
+ *
+ * A `.feature` scenario or a Playwright `test(...)` title is already a whole sentence
+ * written to stand alone — `Add a visit attended by a vet` — so prefixing it with the
+ * file it happens to sit in adds a word nobody needs and takes the room the sentence uses.
+ */
+function qualifiedTitle(title: string, source: string): string {
+  if (!source.endsWith('.java')) return title;
+  const cls = source.split('/').pop()!.replace(/\.java$/, '');
+  return `${cls}: ${title}`;
+}
+
+/**
+ * The picture's heading says it is a test. Without the word, `Add a visit to an existing
+ * pet from the owner detail page` reads like a feature's name, and a reader landing on the
+ * picture (a review page, a slide) takes the arrows for how the app always behaves rather
+ * than for one recorded run of one test (12 Oct 2026, Victor).
+ */
+export const TEST_TITLE_PREFIX = 'Test: ';
+
+// Left to right is the direction a call travels. Browser and Test never appear together:
+// one is a browser suite's lifeline, the other a @SpringBootTest's, and each drives the
+// backend from the same place on the page.
+const PARTICIPANT_ORDER = ['Browser', 'Test', 'Backend', 'DB', 'NotificationService'];
+
+// A lifeline whose name is not a bare identifier — `Notification module` — has to be
+// quoted, on its own `participant` line and on every arrow that touches it, or PlantUML
+// reads the first word as the whole name and chokes on the rest. Quoted only where it is
+// needed: writing `participant "Backend"` too would repaint every committed diagram, and
+// the `.puml` is diffed textually by the review page.
+//
+// The one-word names are also what the deployment guardrail matches (`\w+ -> \w+` in
+// DeploymentDiagramTest), so a multi-word lifeline is invisible to it — which is the
+// right answer for a *logical* module that ships inside the Backend container and has no
+// box of its own on a picture of what is deployed.
+const BARE_IDENTIFIER = /^[A-Za-z_]\w*$/;
+
+export function pumlName(participant: string): string {
+  return BARE_IDENTIFIER.test(participant) ? participant : `"${participant}"`;
+}
+
+function stereotypesOf(scenarios: DiagramScenario[]): Map<string, string> {
+  const kinds = new Map<string, string>();
+  for (const span of scenarios.flatMap((s) => s.traces.flat())) {
+    const participant = span.attributes[PARTICIPANT_ATTRIBUTE]?.trim();
+    const kind = span.attributes[STEREOTYPE_ATTRIBUTE]?.trim();
+    if (participant && kind) kinds.set(participant, kind);
+  }
+  return kinds;
+}
+
+// «kind» goes into the display name rather than as PlantUML's own `<<kind>>`: the review
+// page's parsers read `participant X` and `participant "…" as X`, and nothing after either.
+function participantLine(participant: string, kind: string | undefined): string {
+  return kind
+    ? `participant "«${kind}»\\n${participant}" as ${pumlName(participant)}`
+    : `participant ${pumlName(participant)}`;
+}
+
+function orderedParticipants(present: Set<string>): string[] {
+  const ranked = PARTICIPANT_ORDER.filter((p) => present.has(p));
+  const rest = [...present].filter((p) => !PARTICIPANT_ORDER.includes(p)).sort();
+  return [...ranked, ...rest];
+}
+
+function emitTrace(
+  spans: NormSpan[], lines: string[], present: Set<string>, options: DiagramOptions,
+  collector: DetailCollector, operations: OperationNames, methodLinks: MethodLinks,
+  clientMethods: ClientMethods, controllers: Controllers,
+): void {
+  const byId = new Map(spans.map((s) => [s.spanId, s]));
+  // Indexed once: filtering the whole span array per span made an N+1-heavy trace
+  // (hundreds of spans, which is exactly what these diagrams are for) quadratic.
+  const childrenByParent = new Map<string, NormSpan[]>();
+  for (const span of spans) {
+    const siblings = childrenByParent.get(span.parentSpanId) ?? [];
+    siblings.push(span);
+    childrenByParent.set(span.parentSpanId, siblings);
+  }
+  for (const siblings of childrenByParent.values()) {
+    siblings.sort((a, b) => a.startNano - b.startNano);
+  }
+  const childrenOf = (id: string) => childrenByParent.get(id) ?? [];
+
+  /**
+   * How the transaction this span opened ended, or undefined when it opened none.
+   *
+   * In this codebase the opener is every Spring Data repository method, because nothing
+   * above them is `@Transactional` — so each call gets its own transaction and its own
+   * session, which is a fact about the design worth being able to see.
+   */
+  const transactionOutcome = (span: NormSpan): string | undefined =>
+    span.attributes[TRANSACTION_OUTCOME_ATTRIBUTE]?.trim()
+      || (childrenOf(span.spanId).some((c) => c.name === TRANSACTION_COMMIT)
+        ? COMMITTED : undefined);
+  const opensTransaction = (span: NormSpan): boolean => transactionOutcome(span) !== undefined;
+
+  const nearestAncestor = (span: NormSpan, matches: RegExp): NormSpan | undefined => {
+    for (let up = span.parentSpanId ? byId.get(span.parentSpanId) : undefined;
+      up; up = up.parentSpanId ? byId.get(up.parentSpanId) : undefined) {
+      if (matches.test(up.name)) return up;
+    }
+    return undefined;
+  };
+
+  // Who asked for this query — the repository method if there is one, else the session
+  // call. Both are already in the trace; the diagram drops them as arrows precisely
+  // because they belong *on* the query.
+  const callerOf = (span: NormSpan): string | undefined => {
+    const source = nearestAncestor(span, REPOSITORY_SPAN_RE)
+      ?? nearestAncestor(span, HIBERNATE_SPAN_RE);
+    // A caller drawn as the frame around this query has already named it; repeating the
+    // name on the arrow inside its own box says the same thing twice.
+    if (!source || opensTransaction(source)) return undefined;
+    return unqualify(source.name);
+  };
+
+
+  /**
+   * The label of the arrow into a SERVER span: its words open the request as it was sent — the
+   * concrete URL, the headers, the body (genseq/http-request.ts) — for every HTTP arrow, with a
+   * body or without, as the inter-service arrows' words open their payload (Victor, 10 Nov 2026).
+   * The panel keeps the title `Browser → Backend: GET /api/owners/{ownerId}`: the review page
+   * reads the route back out of it to name the controller in the panel's head.
+   *
+   * Under `handler: 'panel'` the controller is named only in that panel's head; under `call`
+   * it is a self-call on the receiving lifeline (below).
+   *
+   * A browser request whose frontend method is unknown has no call arriving from the left to
+   * carry the line that sent it, so that line hangs off the words as a bare `↗` of its own.
+   */
+  const requestLabel = (
+    span: NormSpan, parent: NormSpan | undefined, pp: string, p: string,
+    landedOn: Controller | undefined,
+  ): string => {
+    const text = arrowLabel(span, p, options, operations);
+    const drawnAsCall = parent?.kind === 'CLIENT' && clientMethods(parent) !== undefined;
+    const sentFrom = !drawnAsCall && parent?.attributes[CALL_SITE_ATTRIBUTE]
+      ? methodLinks(parent) : undefined;
+    let words: string;
+    if (options.interactive) {
+      const body = options.httpBodies ? bodyOf(span, parent, 'http.request.body') : undefined;
+      const request = recordedRequest(span, parent, body);
+      const steps = [{label: 'request', text: requestMessage(request)}];
+      words = linkLabel(text, collector, {title: `${pp} → ${p}: ${span.name}`, steps, request}, REQUEST_TOOLTIP);
+      if (sentFrom) words += ` [[${sentFrom} ${METHOD_LINK_MARKER}]]`;
+    } else {
+      words = linkedMethodLabel(text, sentFrom);
+    }
+    return words;
+  };
+
+  const walk = (span: NormSpan, out: string[], parentParticipant?: string): void => {
+    // Whatever the driver does inside a query is the database's business: drawing a
+    // child of a DB span would put an arrow *out* of the DB lifeline, as if the
+    // database were calling the backend back.
+    if (parentParticipant === 'DB') return;
+
+    // The commit is the closing edge of the frame drawn below — an arrow for it as well
+    // would draw the same event twice, once as a boundary and once as a message.
+    const parentSpan = span.parentSpanId ? byId.get(span.parentSpanId) : undefined;
+    if (span.name === TRANSACTION_COMMIT && parentSpan && opensTransaction(parentSpan)) return;
+
+    const p = participantOf(span);
+    // A call into the driver that carries no statement is not a query — see
+    // `isStatementlessDbSpan`. Dropped whole: no arrow, no activation, no note.
+    if (p === 'DB' && isStatementlessDbSpan(span)) return;
+    const parent = parentSpan;
+    const pp = parent ? participantOf(parent) : undefined;
+    const crossing = pp !== undefined && pp !== p;
+    // A repository call is drawn as a call: a self-hop, an activation, and its statements
+    // fired from inside it. That is the shape a reader expects of a method that queries,
+    // and it gives the transaction frame somewhere to sit.
+    const selfCustom = pp === p && span.kind === 'INTERNAL'
+      && !(HIBERNATE_SPAN_RE.test(span.name)
+        && nearestAncestor(span, REPOSITORY_SPAN_RE) !== undefined);
+
+    // Draw the subtree first: an activation bar is only worth its vertical space
+    // when something is drawn *inside* it. A call that reaches nobody — a leaf DB
+    // query, a self-span with no children — gets a bare arrow instead.
+    const inner: string[] = [];
+    for (const child of childrenOf(span.spanId)) walk(child, inner, p);
+
+    // A transaction's scope is a region of the conversation, not a message in it, so it is
+    // drawn as a frame around everything that ran inside it. The reader can then see which
+    // queries shared a transaction and a Hibernate session — and, just as usefully, which
+    // ones ran outside every frame, as the lazy loads of an N+1 do.
+    //
+    // The frame wraps the *inside* of the span, never the span's own arrow: when the
+    // transaction is opened by the request handler itself — `@Transactional` on a
+    // controller method — framing the span would swallow the request and the response
+    // with it, and the picture would lose the call it is about.
+    const outcome = inner.length > 0 ? transactionOutcome(span) : undefined;
+    const body = outcome ? [transactionHeader(outcome), ...inner, 'end'] : inner;
+
+    if (!crossing && !selfCustom) {
+      present.add(p);
+      // A browser request is drawn as a call too: the frontend method it went through
+      // (`OwnerService.getOwnerById`, genseq/client-method.ts), and the request leaving from
+      // inside its activation — the shape a repository call has on the Backend. Its words open
+      // the line that sent the request, in this run.
+      //
+      // The call arrives from the left edge, not as a self-call (Victor, 10 Nov 2026): nothing
+      // on the Browser calls its own service, the user's click does, and that is off the page.
+      const via = span.kind === 'CLIENT' && inner.length > 0 ? clientMethods(span) : undefined;
+      if (via) {
+        out.push(`[-> ${pumlName(p)}: ${linkedMethodLabel(via, methodLinks(span))}`,
+          `activate ${pumlName(p)}`, ...body, `deactivate ${pumlName(p)}`);
+      } else {
+        out.push(...body);
+      }
+      return;
+    }
+
+    // The baked-in notes and the click-to-reveal markers are the same fact drawn two
+    // ways, so a diagram carries one or the other, never both.
+    const bodies = options.httpBodies && !options.interactive && crossing
+      ? `${pumlName(pp!)}, ${pumlName(p)}` : undefined;
+
+    // An HTTP request is the arrow into a SERVER span. Its words open the request itself, so
+    // the method it landed on — the controller, the first class of the application it reaches
+    // (genseq/controller-location.ts) — is drawn where `options.handler` says: a third line of
+    // the label, or a self-call that everything the request did nests inside.
+    const isRequest = crossing && span.kind === 'SERVER';
+    const landedOn = isRequest ? controllers(span) : undefined;
+    // The self-call is the first thing inside the request's activation, and gets one of its own
+    // only when something ran inside it: the same rule as every other bar on the picture.
+    let inside = body;
+    if (landedOn && options.handler === 'call') {
+      const P = pumlName(p);
+      const self = `${P} -> ${P}: ${linkedMethodLabel(landedOn.name, landedOn.handle)}`;
+      inside = body.length > 0 ? [self, `activate ${P}`, ...body, `deactivate ${P}`] : [self];
+    }
+
+    if (isRequest) {
+      present.add(pp!);
+      present.add(p);
+      out.push(`${pumlName(pp!)} -> ${pumlName(p)}: ${requestLabel(span, parent, pp!, p, landedOn)}`);
+      if (bodies) out.push(...jsonNote(bodies, bodyOf(span, parent, 'http.request.body')));
+    } else if (crossing) {
+      present.add(pp!);
+      present.add(p);
+      const steps = p === 'DB'
+        ? sqlSteps(span, options)
+        : bodySteps(bodyOf(span, parent, 'http.request.body'), 'request body', options);
+      const text = arrowLabel(span, p, options, operations, p === 'DB' ? callerOf(span) : undefined);
+      // The panel is titled with what the arrow says, not with the span's generic name:
+      // a reader who clicked `OwnerRepository.findById` should not be told the thing they
+      // opened is called `SELECT petclinic.owners`.
+      const title = p === 'DB' ? text : `${pp} → ${p}: ${span.name}`;
+      const tooltip = p === 'DB' ? SQL_TOOLTIP : BODY_TOOLTIP;
+      const entry = {title, steps};
+      // The ⊕ that unfolds the SQL or the JSON body wins where there is something to unfold,
+      // and where there is not the words are free for the code the span was opened on.
+      // `notify-visit-booked` is that case — a crossing @WithSpan arrow that reveals nothing,
+      // and until this it was the only kind of arrow in the picture with no way back to its method.
+      // Where there is both, the ⊕ is a second link beside the words.
+      const wordsTo = methodLinks(span);
+      const label = wordsTo && steps.length > 0
+        ? `${linkedMethodLabel(text, wordsTo)} ${linkMarker(collector, entry, tooltip)}`
+        : steps.length > 0
+          ? linkLabel(text, collector, entry, tooltip)
+          : linkedMethodLabel(text, wordsTo);
+      out.push(`${pumlName(pp!)} -> ${pumlName(p)}: ${label}`);
+      if (bodies) out.push(...jsonNote(bodies, bodyOf(span, parent, 'http.request.body')));
+    } else {
+      // a self-span (e.g. @WithSpan) whose children — DB calls, downstream
+      // requests — render inside its own lifetime
+      present.add(p);
+      out.push(`${pumlName(p)} -> ${pumlName(p)}: ${linkedMethodLabel(span.name, methodLinks(span))}`);
+    }
+
+    if (inside.length > 0) out.push(`activate ${pumlName(p)}`);
+    out.push(...inside);
+    // Only a meaningful return (an HTTP status) earns an arrow back.
+    const label = crossing ? returnLabel(span) : undefined;
+    if (label) {
+      const steps = bodySteps(bodyOf(span, parent, 'http.response.body'), 'response body', options);
+      out.push(`${pumlName(p)} --> ${pumlName(pp!)}: ${
+        linkLabel(label, collector, {title: `${p} → ${pp}: ${label}`, steps}, BODY_TOOLTIP)}`);
+    }
+    if (bodies) out.push(...jsonNote(bodies, bodyOf(span, parent, 'http.response.body')));
+    if (inside.length > 0) out.push(`deactivate ${pumlName(p)}`);
+  };
+
+  const roots = spans
+    .filter((s) => !s.parentSpanId || !byId.has(s.parentSpanId))
+    .sort((a, b) => a.startNano - b.startNano);
+  for (const root of roots) walk(root, lines);
+}
+
+/** One tagged test, with every trace its interactions produced. */
+/**
+ * Where a self-call arrow's method lives, as a `src://` handle — see code-location.ts.
+ *
+ * A function rather than a table because only the generator can read the working tree:
+ * the unit tests render from spans alone and get plain labels, which is the same bargain
+ * the section-header links strike in generate.ts.
+ */
+/**
+ * Where one arrow's label should point, if anywhere.
+ *
+ * The scenario comes with it because a step arrow is resolved *inside* the section being
+ * drawn: two scenarios in one file can open with the same sentence, and without knowing
+ * which one is on screen both arrows would point at the first one's line.
+ */
+export type MethodLinks = (span: NormSpan, scenario?: DiagramScenario) => string | undefined;
+
+const NO_METHOD_LINKS: MethodLinks = () => undefined;
+
+/**
+ * The frontend method a browser CLIENT span's request went through, as the call arriving
+ * on the Browser says it: `OwnerService.getOwnerById` — see client-method.ts. Undefined draws the
+ * request straight off the Browser lifeline, as it always was.
+ */
+export type ClientMethods = (span: NormSpan) => string | undefined;
+
+const NO_CLIENT_METHODS: ClientMethods = () => undefined;
+
+/** The method a request landed on: `OwnerRestController.getOwner`, and its `src://` handle. */
+export interface Controller {
+  name: string;
+  handle: string;
+}
+
+/**
+ * The controller method a SERVER span's request landed on — see controller-location.ts.
+ * Undefined draws the request with no controller: no third line, no self-call.
+ */
+export type Controllers = (span: NormSpan) => Controller | undefined;
+
+const NO_CONTROLLERS: Controllers = () => undefined;
+
+export interface DiagramScenario {
+  title: string;
+  traces: NormSpan[][];
+  /** `src://path:line` of the test this section came from, when it could be located. */
+  link?: string;
+  /** Traced because GENSEQ_SELECT named it, not because it carries the tag. */
+  selected?: boolean;
+}
+
+/** The picture and, when it is interactive, what each of its markers reveals. */
+export interface RenderedDiagram {
+  puml: string;
+  details: DetailIndex;
+}
+
+export function renderDiagram(
+  title: string,
+  scenarios: DiagramScenario[],
+  options: DiagramOptions = DEFAULT_DIAGRAM_OPTIONS,
+  operations: OperationNames = defaultOperations(),
+  methodLinks: MethodLinks = NO_METHOD_LINKS,
+  clientMethods: ClientMethods = NO_CLIENT_METHODS,
+  controllers: Controllers = NO_CONTROLLERS,
+): RenderedDiagram {
+  // A trace can carry spans yet draw nothing — a lone browser `click`, say. Render
+  // each in isolation and keep only what has content, so an empty trace cannot
+  // pad a section, and a scenario left with nothing cannot leave a bare header.
+  const present = new Set<string>();
+  const collector = new DetailCollector();
+  const sections: DiagramSection[] = [];
+  for (const scenario of scenarios) {
+    const lines: string[] = [];
+    // Bound to the section being drawn, so `emitTrace` and everything under it stay
+    // unaware that a link can depend on which scenario it is in.
+    const scoped: MethodLinks = (span) => methodLinks(span, scenario);
+    for (const spans of scenario.traces) {
+      const traceLines: string[] = [];
+      const drawn = new Set<string>();
+      emitTrace(spans, traceLines, drawn, options, collector, operations, scoped, clientMethods,
+        controllers);
+      if (traceLines.length === 0) continue;
+      drawn.forEach((p) => present.add(p));
+      lines.push(...traceLines);
+    }
+    if (lines.length === 0) continue;
+    sections.push({title: scenario.title, link: scenario.link, lines});
+  }
+
+  // The marker is a hyperlink, and a link that shouts blue-and-underlined would
+  // read as the arrow's subject rather than as a handle beside it.
+  const interactiveHeader = options.interactive ? [
+    'skinparam hyperlinkUnderline false',
+    'skinparam hyperlinkColor #1A4FA0',
+  ] : [];
+
+  // One scenario per picture is the normal case now, and then the title IS the scenario:
+  // `adds a visit to an existing pet`, clickable, straight into the test at its own line.
+  //
+  // It used to be the file path, with the scenario repeated underneath as a `== divider ==`
+  // — two headings, a hundred characters of `petclinic-backend/src/test/java/victor/…`
+  // above four words that were the thing the reader came for. The divider's job was to
+  // separate scenarios inside one file; with one scenario there is nothing to separate,
+  // and the link it carried moves up into the title rather than being lost.
+  //
+  // Several sections still draw the old way. Nothing this generator writes takes that
+  // path any more, but `renderDiagram` is a public function and a caller handing it two
+  // scenarios means two chapters, which need naming and separating.
+  const solo = sections.length === 1 ? sections[0] : undefined;
+  const kinds = stereotypesOf(scenarios);
+  const header = [
+    '@startuml',
+    // ' starts a PlantUML comment: this one warns whoever opens the *file*.
+    // A comment never reaches the rendered diagram, so the footer below repeats the
+    // warning for a reader of the *image* — the picture is what ends up pasted in a
+    // review, a slide or a wiki page.
+    `' ⚠️  GENERATED FILE — DO NOT EDIT. Every edit is lost on the next run.`,
+    'hide footbox',
+    ...interactiveHeader,
+    ...GROUP_TAIL_STYLE,
+    `title ${solo ? linkedSectionTitle(TEST_TITLE_PREFIX + qualifiedTitle(solo.title, title), solo.link) : title}`,
+    // footer (bottom of every page) states the diagram's provenance, naming the opt-in
+    // the reader will actually find in the file above: a .feature/.spec.ts carries the
+    // `@generate_sequence` tag, a @SpringBootTest the `@GenerateSequence` annotation.
+    // It also carries the "do not edit" warning, which used to sit in a `legend right`
+    // panel: a framed box floating beside the conversation the diagram exists to show,
+    // for a line that reads just as well under it.
+    //
+    // …and, since the title stopped being the file, the file. A `.puml` embedded in a
+    // README or pasted into a slide is read with nothing around it to say where it came
+    // from; here it costs a few words on a line that was already there.
+    //
+    // A test traced only because GENSEQ_SELECT named it carries no tag, so it says so instead.
+    `footer ${provenanceOf(title, scenarios)} in ${title} — `
+    + 'generated from real traces of end-to-end '
+    + 'test runs, do not edit ❗',
+    ...orderedParticipants(present).map((p) => participantLine(p, kinds.get(p))),
+  ];
+  // A divider per chapter, only where there are chapters to tell apart. PlantUML renders
+  // a creole link inside one, and the review page resolves the handle against its own
+  // checkout — the same trade the title now makes.
+  const body = solo ? solo.lines : sections.flatMap(
+    (s) => [`== ${linkedSectionTitle(qualifiedTitle(s.title, title), s.link)} ==`, ...s.lines]);
+  return {
+    puml: [...header, ...body, '@enduml', ''].join('\n'),
+    details: collector.toIndex(),
+  };
+}
+
+export function renderPuml(
+  title: string,
+  scenarios: DiagramScenario[],
+  options: DiagramOptions = DEFAULT_DIAGRAM_OPTIONS,
+  operations: OperationNames = defaultOperations(),
+  methodLinks: MethodLinks = NO_METHOD_LINKS,
+  clientMethods: ClientMethods = NO_CLIENT_METHODS,
+  controllers: Controllers = NO_CONTROLLERS,
+): string {
+  return renderDiagram(title, scenarios, options, operations, methodLinks, clientMethods, controllers).puml;
+}
+
+interface DiagramSection {
+  title: string;
+  link?: string;
+  lines: string[];
+}
+
+export function spansToPuml(
+  spans: NormSpan[], title: string, options?: DiagramOptions, operations?: OperationNames,
+): string {
+  return renderPuml(title, [{title, traces: [spans]}], options, operations);
+}

@@ -1,0 +1,1043 @@
+import {test, expect} from '@playwright/test';
+import * as fs from 'fs';
+import * as path from 'path';
+import {NormSpan, parseTempoTrace, renderDiagram, renderPuml, spansToPuml} from './trace-to-puml';
+import {DEFAULT_DIAGRAM_OPTIONS, DiagramOptions} from './options';
+
+// The diagrams are interactive by default now, so every assertion about a *baked in*
+// label has to say so — which is also the regression test that the static path, the
+// one CI and the committed snapshots depend on, still renders exactly what it did.
+const STATIC: DiagramOptions = {sql: 'statement', httpBodies: false, interactive: false, handler: 'panel'};
+
+const fixture = JSON.parse(
+  fs.readFileSync(path.join(__dirname, '__fixtures__', 'add-visit-trace.json'), 'utf-8'),
+);
+
+// A baked-in DB arrow carries both grains: Hibernate's account of the statement on the
+// first line, then the statement folded one clause per line — `\n` being PlantUML's
+// line break inside a message.
+const INSERT_ORIGIN = 'insert for victor.training.petclinic.domain.Visit';
+const INSERT_LABEL = `${INSERT_ORIGIN}\\nINSERT INTO petclinic.visits `
+  + '(description, pet_id, visit_date, id)\\nVALUES (?, ?, ?, ?)';
+
+// The API's own name for the route, from openapi.yaml, sits above it.
+const ADD_VISIT = 'addVisit\\nPOST /api/visits';
+
+test('parseTempoTrace normalizes spans with service name and kind', () => {
+  const spans = parseTempoTrace(fixture);
+  expect(spans).toHaveLength(5);
+  const server = spans.find((s) => s.spanId === 'b1')!;
+  expect(server.serviceName).toBe('petclinic-backend');
+  expect(server.kind).toBe('SERVER');
+  expect(server.attributes['http.status_code']).toBe('201');
+  const db = spans.find((s) => s.spanId === 'b3')!;
+  expect(db.attributes['db.system']).toBe('postgresql');
+});
+
+test('spansToPuml renders browser→backend→DB with the custom span', () => {
+  const puml = spansToPuml(parseTempoTrace(fixture), 'add a visit', STATIC);
+  expect(puml).toContain('@startuml');
+  expect(puml).toContain('@enduml');
+  expect(puml).toContain('participant Browser');
+  expect(puml).toContain('participant Backend');
+  expect(puml).toContain('participant DB');
+  expect(puml).toContain(`Browser -> Backend: ${ADD_VISIT}`);
+  expect(puml).toContain('Backend -> Backend: book-visit');
+  expect(puml).toContain(`Backend -> DB: ${INSERT_LABEL}`);
+  expect(puml).toContain('Backend --> Browser: 201');
+  // activate/deactivate are balanced
+  const acts = (puml.match(/^activate /gm) ?? []).length;
+  const deacts = (puml.match(/^deactivate /gm) ?? []).length;
+  expect(acts).toBe(deacts);
+});
+
+test('spansToPuml nests a self-span\'s DB call inside the self-span activation', () => {
+  const puml = spansToPuml(parseTempoTrace(fixture), 'add a visit', STATIC);
+  // book-visit (@WithSpan) opens its own activation; the INSERT it triggers
+  // must be drawn inside that activation, then the activation closes.
+  expect(puml).toContain(
+    'Backend -> Backend: book-visit\n' +
+    'activate Backend\n' +
+    `Backend -> DB: ${INSERT_LABEL}\n` +
+    'deactivate Backend\n',
+  );
+  // the DB call carries no meaningful return value, so no return arrow is drawn
+  expect(puml).not.toContain('DB --> Backend: return');
+});
+
+// Every activation bar costs vertical space, and a bar around a call that
+// reaches nobody encloses nothing — the diagram grows for no information.
+test('a call that reaches nothing draws a bare arrow, no activation bar', () => {
+  const puml = spansToPuml(parseTempoTrace(fixture), 'add a visit', STATIC);
+  // the INSERT is a leaf: arrow in, nothing inside, no box on the DB lifeline
+  expect(puml).not.toContain('activate DB');
+  expect(puml).not.toContain('deactivate DB');
+  // the spans that do enclose something keep theirs
+  expect(puml).toContain('activate Backend');
+});
+
+test('spansToPuml footers the diagram with its provenance', () => {
+  const puml = spansToPuml(parseTempoTrace(fixture), 'add a visit', STATIC);
+  // a PlantUML footer renders at the very bottom — provenance, not diagram content
+  expect(puml).toContain('footer @generate_sequence');
+  // the title stays a clean single line, no subtitle, no note, no caption
+  expect(puml).toContain('\ntitle Test: add a visit\n');
+  expect(puml).not.toContain('note across');
+  expect(puml).not.toContain('caption');
+});
+
+// "SELECT petclinic.owners" is true of every query the repository fires; Hibernate's
+// account and the statement are what tell the reader which one this arrow is.
+test('a DB arrow carries the statement, not the generic span name', () => {
+  const puml = spansToPuml(parseTempoTrace(fixture), 'add a visit', STATIC);
+  expect(puml).not.toContain('Backend -> DB: INSERT petclinic.visits');
+  expect(puml).toContain('VALUES (?, ?, ?, ?)');
+});
+
+// The origin comment is Hibernate talking about the statement, not part of it: it
+// belongs on the label, never folded in among the clauses.
+test('the origin comment labels the arrow and stays out of the folded SQL', () => {
+  const puml = spansToPuml(parseTempoTrace(fixture), 'add a visit', STATIC);
+  expect(puml).toContain(`Backend -> DB: ${INSERT_ORIGIN}\\nINSERT INTO`);
+  expect(puml).not.toContain('/*');
+});
+
+const dbSpanWithoutStatement: NormSpan[] = [
+  {
+    traceId: 't3', spanId: 'd1', parentSpanId: '', name: 'POST /api/visits',
+    kind: 'SERVER', serviceName: 'petclinic-backend', startNano: 1, attributes: {},
+  },
+  {
+    traceId: 't3', spanId: 'd2', parentSpanId: 'd1', name: 'SELECT petclinic.owners',
+    kind: 'CLIENT', serviceName: 'petclinic-backend', startNano: 2,
+    attributes: {'db.system': 'postgresql'},
+  },
+];
+
+test('a DB span with no statement attribute keeps its span name', () => {
+  const puml = spansToPuml(dbSpanWithoutStatement, 'no statement', STATIC);
+  expect(puml).toContain('Backend -> DB: SELECT petclinic.owners');
+});
+
+// The traces carry SQL, bound values and payloads all at once; these switches
+// decide what reaches the page, so a different level of detail is a re-render.
+test('SEQ_SQL=off falls back to the generic span name', () => {
+  const puml = spansToPuml(parseTempoTrace(fixture), 'add a visit', {...STATIC, sql: 'off'});
+  expect(puml).toContain('Backend -> DB: INSERT petclinic.visits');
+  expect(puml).not.toContain('VALUES');
+});
+
+test('SEQ_SQL=values puts the bound parameters back into the statement', () => {
+  const puml = spansToPuml(parseTempoTrace(fixture), 'add a visit', {...STATIC, sql: 'values'});
+  expect(puml).toContain("VALUES ('annual checkup', 7, '2026-08-20', 42)");
+  expect(puml).not.toContain('VALUES (?, ?, ?, ?)');
+});
+
+// The payloads are captured in the browser, so they sit on the frontend CLIENT
+// span — one level above the backend SERVER span the arrow is drawn from.
+test('SEQ_HTTP_BODIES draws the request and response payloads as notes', () => {
+  const puml = spansToPuml(parseTempoTrace(fixture), 'add a visit', {...STATIC, httpBodies: true});
+  expect(puml).toContain('note over Browser, Backend');
+  expect(puml).toContain('"description": "annual checkup"');
+  expect(puml).toContain('"id": 42');
+  expect(puml).toContain('end note');
+});
+
+test('payloads stay off unless asked for', () => {
+  const puml = spansToPuml(parseTempoTrace(fixture), 'add a visit', STATIC);
+  expect(puml).not.toContain('note over');
+});
+
+// The warning rides the footer rather than a `legend right` panel. How the picture was
+// recorded and how to re-render it at another detail level is documentation about the
+// tool: a reader of the *image* cannot act on it, and the box took more room beside the
+// diagram than the diagram.
+test('the generated-file warning rides the footer, not a legend box', () => {
+  const puml = spansToPuml(parseTempoTrace(fixture), 'add a visit', {...STATIC, sql: 'values', httpBodies: true});
+  expect(puml).not.toContain('legend');
+  // …and the file, since the title stopped naming it: a .puml pasted into a slide is read
+  // with nothing around it to say where it came from.
+  expect(puml).toContain(
+    'footer @generate_sequence in add a visit — generated from real traces of end-to-end '
+    + 'test runs, do not edit ❗');
+});
+
+test('no npm command or env var is drawn into the picture', () => {
+  const puml = spansToPuml(parseTempoTrace(fixture), 'add a visit', {...STATIC, sql: 'values', httpBodies: true});
+  expect(puml).not.toContain('Detail shown here');
+  expect(puml).not.toContain('npm run diagram');
+  expect(puml).not.toContain('SEQ_SQL=');
+  expect(puml).not.toContain('Tempo');
+});
+
+const lonelyClick: NormSpan[] = [{
+  traceId: 't2', spanId: 'c1', parentSpanId: '', name: 'click',
+  kind: 'INTERNAL', serviceName: 'petclinic-frontend', startNano: 1, attributes: {},
+}];
+
+// One diagram per scenario — a scenario's
+// several traces (each browser interaction opens its own) run together inside
+// its section, because the reader thinks in scenarios, not in traces.
+test('renderPuml titles by source file and sections by scenario', () => {
+  const puml = renderPuml('add-visit.spec.ts', [
+    {title: 'Add a visit', traces: [parseTempoTrace(fixture)]},
+    {title: 'Cancel a visit', traces: [parseTempoTrace(fixture)]},
+  ]);
+
+  expect(puml).toContain('\ntitle add-visit.spec.ts\n');
+  expect(puml).toContain('== Add a visit ==');
+  expect(puml).toContain('== Cancel a visit ==');
+  // participants are declared once for the whole file, not per section
+  expect(puml.match(/^participant Browser$/gm)).toHaveLength(1);
+});
+
+// The browser emits standalone spans (a lone `click`, say) that draw no arrow at
+// all. Those traces must vanish inside their scenario, and a scenario left with
+// nothing to draw must not leave an empty section behind.
+test('renderPuml drops traces that would draw nothing', () => {
+  const puml = renderPuml('add-visit.spec.ts', [
+    {title: 'Add a visit', traces: [lonelyClick, parseTempoTrace(fixture)]},
+    {title: 'Clicked around', traces: [lonelyClick]},
+  ]);
+
+  // Two scenarios in, one drawn — so what comes out is a solo diagram: the survivor
+  // names the picture, and there is no chapter left to divide it from.
+  expect(puml).toContain('title Test: Add a visit');
+  expect(puml).not.toContain('Clicked around');
+  expect(puml).not.toContain('== ');
+  expect(puml).toContain(ADD_VISIT);
+});
+
+// Several chapters still divide, because then there is something to divide.
+test('two scenarios that both draw keep their dividers, and the file stays the title', () => {
+  const puml = renderPuml('add-visit.spec.ts', [
+    {title: 'Add a visit', traces: [parseTempoTrace(fixture)]},
+    {title: 'Add another', traces: [parseTempoTrace(fixture)]},
+  ]);
+
+  expect(puml).toContain('title add-visit.spec.ts');
+  expect(puml).toContain('== Add a visit ==');
+  expect(puml).toContain('== Add another ==');
+});
+
+// A Java method name read back as a sentence is half a name: `remembers the vet who
+// attended it` says nothing about which class, and therefore which endpoint, it is about.
+// The page that lists these pictures lists them by their headings, so the heading carries
+// the class. A .feature/.spec.ts title is already a whole sentence and keeps it.
+test('a Java scenario is headed by its class, a Playwright one by itself', () => {
+  const java = renderPuml(
+    'petclinic-backend/src/test/java/victor/training/petclinic/rest/AddVisitApiTest.java',
+    [{title: 'remembers the vet who attended it', traces: [parseTempoTrace(fixture)]}]);
+  expect(java).toContain('title Test: AddVisitApiTest: remembers the vet who attended it');
+
+  const spec = renderPuml('add-visit.spec.ts',
+    [{title: 'Add a visit', traces: [parseTempoTrace(fixture)]}]);
+  expect(spec).toContain('title Test: Add a visit');
+
+  // Two chapters in one Java file are two qualified headings, for the same reason.
+  const two = renderPuml(
+    'petclinic-backend/src/test/java/victor/training/petclinic/rest/AddVisitApiTest.java',
+    [
+      {title: 'adds a visit', traces: [parseTempoTrace(fixture)]},
+      {title: 'remembers the vet', traces: [parseTempoTrace(fixture)]},
+    ]);
+  expect(two).toContain('== AddVisitApiTest: adds a visit ==');
+  expect(two).toContain('== AddVisitApiTest: remembers the vet ==');
+});
+
+// ── progressive disclosure ────────────────────────────────────────────────────
+// The default picture is the simplified one, and every arrow that has more to say
+// carries a link marker whose id addresses that arrow's detail in the sidecar.
+
+const MARKER = /\[\[genseq:\/\/([a-z0-9-]+)\{[^}]*\} [^\]]*\]\]/;
+
+interface Step {label: string; text: string; alternate?: {label: string; text: string}}
+
+interface Entry {title: string; steps: Step[]; request?: {url: string}}
+
+const detailOn = (line: string, details: Record<string, Entry>) =>
+  details[MARKER.exec(line)![1]];
+
+const lineWith = (puml: string, needle: string) =>
+  puml.split('\n').find((l) => l.includes(needle))!;
+
+test('an interactive DB arrow is labelled with Hibernate\'s account, SQL behind the link', () => {
+  const {puml, details} = renderDiagram('add-visit.spec.ts',
+    [{title: 'Add a visit', traces: [parseTempoTrace(fixture)]}]);
+
+  const arrow = lineWith(puml, 'Backend -> DB:');
+  expect(arrow).toContain(INSERT_ORIGIN);
+  expect(arrow).not.toContain('VALUES');
+  expect(arrow).toMatch(MARKER);
+  // the whole label is the click target, and the ⊕ rides inside the link rather than
+  // after it — the arrow is what you aim at, the glyph is what says you can
+  expect(arrow.trimEnd().endsWith('⊕]]')).toBe(true);
+  expect(arrow).toContain(`{Click for the statement behind this call} ${INSERT_ORIGIN} ⊕]]`);
+
+  // One step, not a cycle: the bound values are the step's alternate, which the panel
+  // offers as a toggle. Neither is labelled — the panel's title says which call this is,
+  // and a line reading "statement as sent, ? for each bound value" only described the
+  // toggle's own state, above SQL whose `?`s were already in plain sight.
+  const entry = detailOn(arrow, details.details);
+  expect(entry.title).toBe(INSERT_ORIGIN);
+  expect(entry.steps).toHaveLength(1);
+  expect(entry.steps[0].label).toBe('');
+  expect(entry.steps[0].text).toContain('VALUES (?, ?, ?, ?)');
+  expect(entry.steps[0].alternate!.label).toBe('');
+  expect(entry.steps[0].alternate!.text).toContain("VALUES ('annual checkup', 7, '2026-08-20', 42)");
+});
+
+// A DB span the agent captured no parameters for has nothing to put back, so the panel
+// must not offer a toggle onto the same text.
+test('a statement with no bound parameters offers only the statement', () => {
+  const spans = parseTempoTrace(fixture).map((s) => ({
+    ...s,
+    attributes: Object.fromEntries(
+      Object.entries(s.attributes).filter(([k]) => !k.startsWith('db.query.parameter.'))),
+  }));
+  const {puml, details} = renderDiagram('x', [{title: 'x', traces: [spans]}]);
+  const steps = detailOn(lineWith(puml, 'Backend -> DB:'), details.details).steps;
+  expect(steps).toHaveLength(1);
+  expect(steps[0].alternate).toBeUndefined();
+});
+
+test('the payloads become markers on the request and the response, not notes', () => {
+  const {puml, details} = renderDiagram('add-visit.spec.ts',
+    [{title: 'Add a visit', traces: [parseTempoTrace(fixture)]}],
+    {sql: 'statement', httpBodies: true, interactive: true, handler: 'panel'});
+
+  expect(puml).not.toContain('note over');
+
+  // The request as an HTTP message: its request line, then — after a blank line — the body.
+  const request = detailOn(lineWith(puml, 'Browser -> Backend:'), details.details);
+  expect(request.steps[0].label).toBe('request');
+  expect(request.steps[0].text).toMatch(/^POST \/api\/visits\n\n\{\n/);
+  expect(request.steps[0].text).toContain('"description": "annual checkup"');
+
+  const response = detailOn(lineWith(puml, 'Backend --> Browser:'), details.details);
+  expect(response.steps[0].label).toBe('response body');
+  expect(response.steps[0].text).toContain('"id": 42');
+});
+
+// A service called by the backend has no browser to capture its payload, so it records the
+// body on its own SERVER span. That body belongs to the arrow into the service — not to the
+// calls the handler goes on to make, which would otherwise inherit it from their parent.
+test('a body recorded on a SERVER span reveals on its arrow, not on the calls it makes', () => {
+  const span = (spanId: string, parentSpanId: string, name: string, kind: NormSpan['kind'],
+    serviceName: string, attributes: Record<string, string>): NormSpan => ({
+    traceId: 'r', spanId, parentSpanId, name, kind, serviceName,
+    startNano: Number(spanId.slice(1)) * 1e6, attributes,
+  });
+  const spans = [
+    span('r1', '', 'POST /api/owners/1/pets/3/visits', 'SERVER', 'petclinic-backend',
+      {'http.status_code': '201'}),
+    span('r2', 'r1', 'POST', 'CLIENT', 'petclinic-backend', {}),
+    span('r3', 'r2', 'POST /api/notifications/visit-booked', 'SERVER', 'mailer',
+      {'http.response.status_code': '202', 'http.request.body': '{"petName":"Leo"}'}),
+    span('r4', 'r3', 'send-sms', 'INTERNAL', 'mailer', {'genseq.participant': 'SMS gateway'}),
+  ];
+  const {puml, details} = renderDiagram('add-visit.spec.ts', [{title: 'x', traces: [spans]}],
+    {sql: 'statement', httpBodies: true, interactive: true, handler: 'panel'});
+
+  const request = detailOn(lineWith(puml, 'Backend -> mailer:'), details.details);
+  expect(request.steps[0].text).toContain('"petName": "Leo"');
+  expect(lineWith(puml, 'mailer -> "SMS gateway":')).not.toContain('⊕');
+});
+
+// Behind a click a payload costs the picture nothing, so an interactive diagram carries
+// it by default; baked in it is a wall of JSON, so a static one still has to ask.
+// Withholding it by default only meant a reviewer clicked a request arrow and found
+// that it had nothing to say. The request itself opens either way: its URL and headers
+// are no payload (Victor, 10 Nov 2026).
+test('payloads are revealable by default, and a request opens without them', () => {
+  const plain = renderDiagram('x', [{title: 'x', traces: [parseTempoTrace(fixture)]}]);
+  expect(lineWith(plain.puml, 'Browser -> Backend:')).toMatch(MARKER);
+  expect(lineWith(plain.puml, 'Backend --> Browser:')).toMatch(MARKER);
+
+  const withheld = renderDiagram('x', [{title: 'x', traces: [parseTempoTrace(fixture)]}],
+    {sql: 'statement', httpBodies: false, interactive: true, handler: 'panel'});
+  const request = detailOn(lineWith(withheld.puml, 'Browser -> Backend:'), withheld.details.details);
+  expect(request.steps).toEqual([{label: 'request', text: 'POST /api/visits'}]);
+  expect(lineWith(withheld.puml, 'Backend --> Browser:')).not.toMatch(MARKER);
+
+  const none = renderDiagram('x', [{title: 'x', traces: [parseTempoTrace(fixture)]}],
+    {sql: 'off', httpBodies: false, interactive: true, handler: 'panel'});
+  expect(Object.values(none.details.details).map((e) => e.title))
+    .toEqual(['Browser → Backend: POST /api/visits']);
+});
+
+// The review page renders a *textual* diff of the .puml, so an id that moved with
+// its arrow's position would repaint every arrow below an inserted one as changed.
+test('a marker id follows the arrow content, not its position in the file', () => {
+  const one = renderDiagram('x', [{title: 'x', traces: [parseTempoTrace(fixture)]}]);
+  const two = renderDiagram('x', [
+    {title: 'earlier', traces: [parseTempoTrace(fixture)]},
+    {title: 'x', traces: [parseTempoTrace(fixture)]},
+  ]);
+  expect(MARKER.exec(lineWith(two.puml, 'Backend -> DB:'))![1])
+    .toBe(MARKER.exec(lineWith(one.puml, 'Backend -> DB:'))![1]);
+});
+
+test('an interactive diagram tones its link markup down', () => {
+  const {puml} = renderDiagram('x', [{title: 'x', traces: [parseTempoTrace(fixture)]}],
+    {sql: 'values', httpBodies: true, interactive: true, handler: 'panel'});
+  expect(puml).toContain('skinparam hyperlinkUnderline false');
+  expect(puml).toContain('skinparam hyperlinkColor');
+  // The ⊕ on each revealable arrow is the affordance; a paragraph explaining it is not.
+  expect(puml).toContain('⊕]]');
+  expect(puml).not.toContain('deliberately simplified');
+});
+
+// ── the Hibernate session spans ───────────────────────────────────────────────
+// OTel draws a span for the session call behind every query. Under a Spring Data
+// repository it restates the repository method in Hibernate's vocabulary and buys the
+// diagram nothing but a lifeline hop; with no repository above it, it is the only
+// account of what the code asked for.
+
+const backendSpan = (
+  spanId: string, parentSpanId: string, name: string, kind: NormSpan['kind'],
+): NormSpan => ({
+  traceId: 'h1', spanId, parentSpanId, name, kind,
+  serviceName: 'petclinic-backend', startNano: Number(spanId.slice(1)), attributes: {},
+});
+
+const query = backendSpan('h4', 'h3', 'SELECT petclinic.owners', 'CLIENT');
+query.attributes = {'db.system': 'postgresql'};
+
+const viaRepository: NormSpan[] = [
+  backendSpan('h1', '', 'GET /api/owners', 'SERVER'),
+  backendSpan('h2', 'h1', 'OwnerRepository.findById', 'INTERNAL'),
+  backendSpan('h3', 'h2', 'Session.find victor.training.petclinic.domain.Owner', 'INTERNAL'),
+  query,
+];
+
+test('a session span under a repository is dropped, its query kept', () => {
+  const puml = spansToPuml(viaRepository, 'via repository', STATIC);
+  expect(puml).toContain('Backend -> Backend: OwnerRepository.findById');
+  expect(puml).not.toContain('Session.find');
+  expect(puml).toContain('Backend -> DB: SELECT petclinic.owners');
+});
+
+test('a session span with no repository above it is kept', () => {
+  const direct = viaRepository.filter((s) => s.spanId !== 'h2')
+    .map((s) => (s.spanId === 'h3' ? {...s, parentSpanId: 'h1'} : s));
+  const puml = spansToPuml(direct, 'direct entity manager', STATIC);
+  expect(puml).toContain('Backend -> Backend: Session.find victor.training.petclinic.domain.Owner');
+});
+
+// `Hibernate Query` is the same instrumentation saying the same redundant thing for a
+// query rather than a lookup.
+test('a Hibernate Query span under a repository is dropped too', () => {
+  const spans = viaRepository.map(
+    (s) => (s.spanId === 'h3' ? {...s, name: 'Hibernate Query'} : s));
+  const puml = spansToPuml(spans, 'via repository', STATIC);
+  expect(puml).not.toContain('Hibernate Query');
+  expect(puml).toContain('Backend -> DB: SELECT petclinic.owners');
+});
+
+// Dropping an arrow must not drop the activation bar that balanced it.
+test('collapsing a session span leaves activate/deactivate balanced', () => {
+  const puml = spansToPuml(viaRepository, 'via repository', STATIC);
+  expect((puml.match(/^activate /gm) ?? []).length)
+    .toBe((puml.match(/^deactivate /gm) ?? []).length);
+});
+
+// ── Transaction scope ─────────────────────────────────────────────────────────
+// The interceptor's commit is emitted as the last child of whatever opened the
+// transaction, so the diagram can draw the region rather than the moment. A bare
+// `Transaction.commit` arrow said a transaction ended somewhere above and left the
+// reader to guess how far up — and said nothing at all about which queries were *not*
+// in one, which is the whole story of an N+1 behind open-session-in-view.
+
+const selectOwners = {
+  ...query,
+  attributes: {'db.system': 'postgresql', 'db.statement': 'select o1_0.id from owners o1_0'},
+};
+
+// Every frame says how its transaction ended, beside the tab — PlantUML's `[…]` tail.
+const COMMITTED_TX = 'group tx [committed]';
+
+const inTransaction: NormSpan[] = [
+  backendSpan('t1', '', 'GET /api/owners', 'SERVER'),
+  backendSpan('t2', 't1', 'OwnerRepository.findById', 'INTERNAL'),
+  {...selectOwners, spanId: 't3', parentSpanId: 't2'},
+  backendSpan('t4', 't2', 'Transaction.commit', 'INTERNAL'),
+  {...selectOwners, spanId: 't5', parentSpanId: 't1'},   // a lazy load, after the commit
+];
+
+test('a transaction is drawn as a frame around what ran inside it', () => {
+  const body = spansToPuml(inTransaction, 'tx', STATIC).split('\n').map((l) => l.trim());
+  const open = body.indexOf(COMMITTED_TX);
+  const close = body.indexOf('end', open);
+  expect(open).toBeGreaterThan(-1);
+  expect(close).toBeGreaterThan(open);
+  // the query inside is inside; the lazy load after the commit is outside
+  expect(body.slice(open, close).filter((l) => l.startsWith('Backend -> DB:'))).toHaveLength(1);
+  expect(body.slice(close).filter((l) => l.startsWith('Backend -> DB:'))).toHaveLength(1);
+});
+
+test('the commit is the frame, not another arrow inside it', () => {
+  expect(spansToPuml(inTransaction, 'tx', STATIC)).not.toContain('Transaction.commit');
+});
+
+// The frame already names the call; repeating it on the arrow it encloses says the same
+// thing twice, so a query inside falls back to describing itself.
+test('a query inside a frame does not repeat the frame\'s label', () => {
+  // split on the whole line: "Backend" contains "end"
+  const inside = spansToPuml(inTransaction, 'tx', STATIC)
+    .split(`${COMMITTED_TX}\n`)[1].split('\nend\n')[0];
+  expect(inside).not.toContain('OwnerRepository.findById');
+  expect(inside).toContain('select owners');
+});
+
+test('a span that opened no transaction is not framed', () => {
+  const noTx = inTransaction.filter((s) => s.name !== 'Transaction.commit');
+  expect(spansToPuml(noTx, 'tx', STATIC)).not.toContain('group ');
+});
+
+// Where the interceptor opens the transaction decides what the frame wraps, and the
+// three placements are genuinely different pictures. Verified against a real trace by
+// putting @Transactional on the controller and re-recording.
+
+const browserSpan = (spanId: string, name: string): NormSpan => ({
+  ...backendSpan(spanId, '', name, 'CLIENT'), serviceName: 'petclinic-frontend',
+});
+
+/** @Transactional on the handler: two repository calls under one transaction. */
+const onController: NormSpan[] = [
+  browserSpan('c0', 'POST'),
+  {...backendSpan('c1', 'c0', 'POST /api/visits', 'SERVER'),
+    attributes: {'http.status_code': '201'}},
+  {...selectOwners, spanId: 'c2', parentSpanId: 'c1'},
+  {...selectOwners, spanId: 'c3', parentSpanId: 'c1'},
+  backendSpan('c4', 'c1', 'Transaction.commit', 'INTERNAL'),
+];
+
+// Framing the span itself would take the request and the response into the box with it,
+// and the picture would lose the call it is about.
+test('a handler-level transaction frames its body, not the request', () => {
+  const body = spansToPuml(onController, 'tx', STATIC).split('\n').map((l) => l.trim());
+  // the request arrow also carries the operation's name, from openapi.yaml
+  const request = body.findIndex(
+    (l) => l.startsWith('Browser -> Backend:') && l.includes('POST /api/visits'));
+  expect(request).toBeGreaterThan(-1);
+  expect(body).toContain('Backend --> Browser: 201');
+  const open = body.indexOf(COMMITTED_TX);
+  const close = body.indexOf('end', open);
+  expect(open).toBeGreaterThan(request);
+  expect(body.slice(open, close).filter((l) => l.startsWith('Backend -> DB:'))).toHaveLength(2);
+});
+
+/** @Transactional on a service: the self-invocation, then the frame inside its activation. */
+const onService: NormSpan[] = [
+  browserSpan('s0', 'POST'),
+  backendSpan('s1', 's0', 'POST /api/visits', 'SERVER'),
+  backendSpan('s2', 's1', 'VisitService.book', 'INTERNAL'),
+  {...selectOwners, spanId: 's3', parentSpanId: 's2'},
+  {...selectOwners, spanId: 's4', parentSpanId: 's2'},
+  backendSpan('s5', 's2', 'Transaction.commit', 'INTERNAL'),
+];
+
+// The frame replaces the self-hop rather than nesting inside it: it already carries the
+// method's name and its extent, so drawing both states the same call twice — which is
+// what the bare `Transaction.commit` arrow did.
+// The call is drawn as a call and the frame sits inside it. A method that queries should
+// look like a method that queries — a hop, an activation, and its statements fired from
+// within — and the frame then has somewhere to sit rather than standing in for the call.
+test('a service-level transaction is a frame inside the call that opened it', () => {
+  const body = spansToPuml(onService, 'tx', STATIC).split('\n').map((l) => l.trim());
+  const call = body.indexOf('Backend -> Backend: VisitService.book');
+  expect(call).toBeGreaterThan(-1);
+  expect(body[call + 1]).toBe('activate Backend');
+  const open = body.indexOf(COMMITTED_TX, call);
+  expect(open).toBeGreaterThan(call);
+  const close = body.indexOf('end', open);
+  expect(body.slice(open, close).filter((l) => l.startsWith('Backend -> DB:'))).toHaveLength(2);
+});
+
+// The frame's job is to show an extent. Whatever opened it is named by the call the frame
+// sits inside, so a longer label would only repeat the line above it.
+test('the frame is called tx, wherever it was opened', () => {
+  expect(spansToPuml(onController, 'tx', STATIC)).toContain(`${COMMITTED_TX}\n`);
+  expect(spansToPuml(onService, 'tx', STATIC)).toContain(`${COMMITTED_TX}\n`);
+  expect(spansToPuml(onService, 'tx', STATIC)).not.toContain('transaction ·');
+});
+
+// ── How the transaction ended ───────────────────────────────────────────────────
+// The agent draws a commit as a span and a rollback as nothing, so the outcome comes from
+// the backend's TransactionOutcomeTracing, stamped on the span that opened the transaction.
+// A trace from before that existed still has its commit span, which says "committed".
+
+const outcome = (spans: NormSpan[], value: string): NormSpan[] => spans
+  .filter((s) => s.name !== 'Transaction.commit')
+  .map((s) => (s.spanId === 't2'
+    ? {...s, attributes: {...s.attributes, 'transaction.outcome': value}} : s));
+
+test('a committed transaction says so beside its tab, in grey', () => {
+  const puml = spansToPuml(outcome(inTransaction, 'committed'), 'tx', STATIC);
+  expect(puml).toContain(`${COMMITTED_TX}\n`);
+  // grey from the header, not an inline <color>: that splits the label into three runs
+  expect(puml).toContain('skinparam sequenceGroupFontColor #888888\n');
+});
+
+test('a rolled-back transaction is framed too, and says so in amber', () => {
+  const body = spansToPuml(outcome(inTransaction, 'rolled back'), 'tx', STATIC)
+    .split('\n').map((l) => l.trim());
+  const open = body.indexOf('group tx [<color:#B26A00>rolled back</color>]');
+  expect(open).toBeGreaterThan(-1);
+  expect(body.slice(open, body.indexOf('end', open))
+    .filter((l) => l.startsWith('Backend -> DB:'))).toHaveLength(1);
+});
+
+test('the stamped outcome wins over the commit span', () => {
+  const failed = inTransaction.map((s) => (s.spanId === 't2'
+    ? {...s, attributes: {'transaction.outcome': 'commit failed'}} : s));
+  const puml = spansToPuml(failed, 'tx', STATIC);
+  expect(puml).toContain('group tx [<color:#B26A00>commit failed</color>]');
+  expect(puml).not.toContain(COMMITTED_TX);
+});
+
+// ── A @SpringBootTest drives the very same renderer ─────────────────────────────
+// Nothing in a trace otherwise separates the test from the code it drives: a MockMvc
+// call and the controller it reaches run in one JVM under one `service.name`. The test
+// spans therefore name their own lifeline (Steps.java sets `genseq.participant=Test`),
+// and the renderer has to honour it — without it the whole picture collapses onto
+// Backend and loses the only hop it exists to show.
+test('a span may declare its own participant, and Test sorts leftmost', () => {
+  // The shape SequenceTraceExtension actually emits: a per-test root that opens the
+  // lifeline, a span per sentence under it, and the instrumented work under those.
+  const spans: NormSpan[] = [
+    {
+      traceId: 'j', spanId: 'j-root', parentSpanId: '', name: 'test: reads an owner back',
+      kind: 'INTERNAL', serviceName: 'petclinic-backend', startNano: 1_000 * 1e6,
+      attributes: {'genseq.participant': 'Test', 'test.name': 'reads an owner back'},
+    },
+    {
+      traceId: 'j', spanId: 'j-step', parentSpanId: 'j-root', name: 'given an owner with a pet',
+      kind: 'INTERNAL', serviceName: 'petclinic-backend', startNano: 1_100 * 1e6,
+      attributes: {'genseq.participant': 'Test'},
+    },
+    {
+      traceId: 'j', spanId: 'j-server', parentSpanId: 'j-step', name: 'GET /api/owners/{ownerId}',
+      kind: 'SERVER', serviceName: 'petclinic-backend', startNano: 1_150 * 1e6,
+      attributes: {'http.status_code': '200'},
+    },
+  ];
+  const puml = renderPuml('petclinic-backend/src/test/java/OwnerTest.java', [{
+    title: 'reads an owner back',
+    traces: [spans],
+  }], STATIC);
+
+  expect(puml.indexOf('participant Test')).toBeLessThan(puml.indexOf('participant Backend'));
+  // the sentence lands on the test's lifeline, and the call crosses to the backend
+  expect(puml).toContain('Test -> Test: given an owner with a pet');
+  expect(puml).toContain('Test -> Backend: ');
+  expect(puml).not.toContain('participant Browser');
+});
+
+// The footer states the diagram's provenance, and the three runners are not
+// interchangeable: a @SpringBootTest's picture naming the Cucumber/Playwright tag would
+// send its reader looking for a `@generate_sequence` that the .java file does not carry.
+test('a Java diagram names the annotation a @SpringBootTest actually carries', () => {
+  const java = renderPuml('petclinic-backend/src/test/java/OwnerTest.java', [{
+    title: 'reads an owner back', traces: [],
+  }], STATIC);
+  expect(java).toContain('footer @GenerateSequence');
+  expect(java).not.toContain('@generate_sequence');
+
+  const spec = renderPuml('src/add-visit.spec.ts', [{title: 'adds a visit', traces: []}], STATIC);
+  expect(spec).toContain('footer @generate_sequence');
+});
+
+// A test GENSEQ_SELECT named (one the branch wrote) carries no tag. A footer claiming
+// `@GenerateSequence in OwnerListTest.java` sent the reader grepping for an annotation
+// that is not there, and contradicted the review card that said `new test`.
+test('a test traced because GENSEQ_SELECT named it does not claim the tag in its footer', () => {
+  const java = renderPuml('petclinic-backend/src/test/java/OwnerListTest.java', [{
+    title: 'returns the first page', traces: [], selected: true,
+  }], STATIC);
+  expect(java).toContain('footer traced because this branch wrote it in '
+    + 'petclinic-backend/src/test/java/OwnerListTest.java');
+  expect(java).not.toContain('@GenerateSequence');
+
+  const feature = renderPuml('src/owner-search.feature', [{
+    title: 'Sorting by city, then reversing it', traces: [], selected: true,
+  }], STATIC);
+  expect(feature).toContain('footer traced because this branch wrote it in src/owner-search.feature');
+  expect(feature).not.toContain('@generate_sequence');
+});
+
+// ── A second process ──────────────────────────────────────────────────────────────
+// The backend's HTTP client span and the SERVER span it opens in notification-service are
+// told apart by service.name alone: that is what makes the hop an arrow between two
+// lifelines, and the name a bare identifier the deployment guardrail can match.
+test('a call into notification-service is drawn as an arrow from Backend to NotificationService', () => {
+  const spans: NormSpan[] = [
+    {
+      traceId: 's', spanId: 's-server', parentSpanId: '', name: 'POST /api/owners/{ownerId}/pets/{petId}/visits',
+      kind: 'SERVER', serviceName: 'petclinic-backend', startNano: 1_000 * 1e6, attributes: {},
+    },
+    {
+      traceId: 's', spanId: 's-client', parentSpanId: 's-server', name: 'POST',
+      kind: 'CLIENT', serviceName: 'petclinic-backend', startNano: 1_100 * 1e6, attributes: {},
+    },
+    {
+      traceId: 's', spanId: 's-notify', parentSpanId: 's-client', name: 'POST /api/notifications/visit-booked',
+      kind: 'SERVER', serviceName: 'notification-service', startNano: 1_200 * 1e6, attributes: {},
+    },
+  ];
+  const puml = renderPuml('src/add-visit.spec.ts', [{
+    title: 'books a visit', traces: [spans],
+  }], STATIC);
+
+  expect(puml).toContain('participant NotificationService');
+  expect(puml).toMatch(/^Backend -> NotificationService: /m);
+});
+
+// ── A module of the backend, drawn as a participant of its own ───────────────────
+// Same mechanism as `Test` above, used for the opposite reason: the Notification module
+// runs *inside* the backend, so nothing in the trace separates it either. It names its
+// own lifeline, and the (fake) SMS gateway it calls names another — which is how a
+// reader sees a call leaving the module at all.
+//
+// Neither name is a bare PlantUML identifier, so both have to be quoted everywhere they
+// appear, or `participant Notification module` is a syntax error and every arrow after
+// it is drawn against a lifeline called `Notification`.
+test('a multi-word participant is quoted on its declaration and on every arrow', () => {
+  const spans: NormSpan[] = [
+    {
+      traceId: 'n', spanId: 'n-server', parentSpanId: '', name: 'POST /api/owners/1/pets/3/visits',
+      kind: 'SERVER', serviceName: 'petclinic-backend', startNano: 1_000 * 1e6,
+      attributes: {'http.status_code': '201'},
+    },
+    {
+      traceId: 'n', spanId: 'n-notify', parentSpanId: 'n-server', name: 'notify-visit-booked',
+      kind: 'INTERNAL', serviceName: 'petclinic-backend', startNano: 1_100 * 1e6,
+      attributes: {'genseq.participant': 'Notification module'},
+    },
+    {
+      traceId: 'n', spanId: 'n-sms', parentSpanId: 'n-notify', name: 'send-sms',
+      kind: 'INTERNAL', serviceName: 'petclinic-backend', startNano: 1_200 * 1e6,
+      attributes: {'genseq.participant': 'SMS gateway'},
+    },
+  ];
+  const puml = renderPuml('src/add-visit.spec.ts', [{
+    title: 'books a visit', traces: [spans],
+  }], STATIC);
+
+  expect(puml).toContain('participant "Notification module"');
+  expect(puml).toContain('participant "SMS gateway"');
+  expect(puml).toContain('Backend -> "Notification module": notify-visit-booked');
+  expect(puml).toContain('"Notification module" -> "SMS gateway": send-sms');
+  expect(puml).toContain('activate "Notification module"');
+  expect(puml).toContain('deactivate "Notification module"');
+  // the one-word lifelines are left exactly as they were: the .puml is diffed textually
+  expect(puml).toContain('participant Backend');
+});
+
+// ── A crossing @WithSpan arrow points at its method too ──────────────────────────
+// PlantUML gives a message label exactly one link, so an arrow that reveals SQL or a JSON
+// body spends it on the ⊕. An arrow into a module reveals nothing, and used to be the only
+// kind in the picture with no way back to the code — `notify-visit-booked` named a method
+// the reader could not open.
+test('a crossing arrow with nothing to reveal links to the method it was opened on', () => {
+  const spans: NormSpan[] = [
+    {
+      traceId: 'm', spanId: 'm-server', parentSpanId: '', name: 'POST /api/owners/1/pets/3/visits',
+      kind: 'SERVER', serviceName: 'petclinic-backend', startNano: 1_000 * 1e6,
+      attributes: {'http.status_code': '201'},
+    },
+    {
+      traceId: 'm', spanId: 'm-notify', parentSpanId: 'm-server', name: 'notify-visit-booked',
+      kind: 'INTERNAL', serviceName: 'petclinic-backend', startNano: 1_100 * 1e6,
+      attributes: {'genseq.participant': 'Notification module'},
+    },
+  ];
+  const puml = renderDiagram('src/add-visit.spec.ts',
+    [{title: 'books a visit', traces: [spans]}],
+    STATIC, new Map(), (span) => span.spanId === 'm-notify'
+      ? 'src://petclinic-backend/src/main/java/Sender.java:42{Click to open Sender.visitBooked}'
+      : undefined).puml;
+
+  expect(puml).toContain('Backend -> "Notification module": '
+    + '[[src://petclinic-backend/src/main/java/Sender.java:42'
+    + '{Click to open Sender.visitBooked} notify-visit-booked \u2197]]');
+});
+
+// ── A browser request links to the line that sent it ─────────────────────────────
+// The link comes from the request's own stack, so it hangs off the browser's CLIENT span
+// (genseq/call-site.ts) while the arrow is drawn from the SERVER span under it.
+const SENT_FROM = 'src://petclinic-frontend/src/app/a.component.ts:22'
+  + '{Click to open the line that sent this request: a.component.ts:22}';
+
+function browserRequest(browserAttributes: Record<string, string>): NormSpan[] {
+  return [
+    {traceId: 'c', spanId: 'c-xhr', parentSpanId: '', name: 'POST', kind: 'CLIENT',
+      serviceName: 'petclinic-frontend', startNano: 1_000 * 1e6, attributes: browserAttributes},
+    {traceId: 'c', spanId: 'c-server', parentSpanId: 'c-xhr', name: 'POST /api/visits',
+      kind: 'SERVER', serviceName: 'petclinic-backend', startNano: 1_100 * 1e6,
+      attributes: {'http.status_code': '201'}},
+  ];
+}
+
+const located = (span: NormSpan) => (span.spanId === 'c-xhr' ? SENT_FROM : undefined);
+const CALL_SITE = {'genseq.call-site': '[{"file":"src/app/a.component.ts","line":22}]'};
+const REQUEST = '{Click for the request as it was sent}';
+
+test('a baked-in browser request links its words to the line that sent it', () => {
+  const puml = renderDiagram('src/add-visit.spec.ts',
+    [{title: 'books a visit', traces: [browserRequest(CALL_SITE)]}],
+    STATIC, new Map(), located).puml;
+  expect(puml).toContain(`Browser -> Backend: [[${SENT_FROM} POST /api/visits ↗]]\n`);
+});
+
+// The words open the request on every HTTP arrow now (Victor, 10 Nov 2026); a request whose
+// frontend method is unknown has no call arriving from the left to carry the line that sent
+// it, so that line is a bare ↗ beside them.
+test('a request with no known frontend method keeps the line that sent it beside its words', () => {
+  const {puml, details} = renderDiagram('src/add-visit.spec.ts',
+    [{title: 'books a visit', traces: [browserRequest({...CALL_SITE, 'http.request.body': '{"a":1}'})]}],
+    undefined, new Map(), located);
+  const [id] = Object.keys(details.details);
+  expect(puml).toContain(`Browser -> Backend: [[genseq://${id}${REQUEST} POST /api/visits ⊕]] `
+    + `[[${SENT_FROM} ↗]]\n`);
+});
+
+test('a request with no known line opens its request and nothing else', () => {
+  const {puml, details} = renderDiagram('src/add-visit.spec.ts',
+    [{title: 'books a visit', traces: [browserRequest({'http.request.body': '{"a":1}'})]}],
+    undefined, new Map(), located);
+  const [id] = Object.keys(details.details);
+  expect(puml).toContain(`Browser -> Backend: [[genseq://${id}${REQUEST} POST /api/visits ⊕]]\n`);
+  expect(puml).not.toContain('src://');
+});
+
+test('a call site the checkout could not confirm leaves the arrow plain', () => {
+  const puml = renderDiagram('src/add-visit.spec.ts',
+    [{title: 'books a visit', traces: [browserRequest(CALL_SITE)]}],
+    STATIC, new Map(), () => undefined).puml;
+  expect(puml).toContain('Browser -> Backend: POST /api/visits\n');
+});
+
+// ── A browser request is drawn as the frontend method it went through ────────────
+// A call arriving on the Browser from the left edge names the service method
+// (genseq/client-method.ts) and opens the line that sent the request; the request leaves from
+// inside its activation, its words open the request as it was sent, and the controller method
+// it landed on (genseq/controller-location.ts) is drawn where SEQ_HANDLER says.
+const LANDED_ON = 'src://petclinic-backend/src/main/java/VisitController.java:30'
+  + '{Click to open VisitController.addVisit}';
+const controller = (span: NormSpan) => (span.kind === 'SERVER'
+  ? {name: 'VisitController.addVisit', handle: LANDED_ON} : undefined);
+const throughVisitService = (span: NormSpan) =>
+  span.spanId === 'c-xhr' ? 'VisitService.addVisit' : undefined;
+const CALL: DiagramOptions = {...DEFAULT_DIAGRAM_OPTIONS, handler: 'call'};
+
+const drawn = (attributes: Record<string, string>, options?: DiagramOptions) => renderDiagram(
+  'src/add-visit.spec.ts', [{title: 'books a visit', traces: [browserRequest(attributes)]}],
+  options, new Map(), located, throughVisitService, controller);
+
+test('a browser request arrives on the Browser from the left, its request sent from inside it', () => {
+  const {puml, details} = drawn(CALL_SITE);
+  const [id] = Object.keys(details.details);
+  const lines = puml.split('\n');
+  const at = lines.indexOf(`[-> Browser: [[${SENT_FROM} VisitService.addVisit ↗]]`);
+  expect(at).toBeGreaterThan(0);
+  expect(lines.slice(at + 1)).toEqual([
+    'activate Browser',
+    `Browser -> Backend: [[genseq://${id}${REQUEST} POST /api/visits ⊕]]`,
+    'Backend --> Browser: 201',
+    'deactivate Browser',
+    '@enduml',
+    '',
+  ]);
+  expect(puml).not.toContain('Browser -> Browser');
+});
+
+// The panel opens on a GET with no body as on a POST with one: it is the request's URL and
+// headers a reader came for, and what the review page's "Open in Bruno" sends again.
+test('every request arrow opens its request, a GET with no body too', () => {
+  const headers = JSON.stringify({Accept: 'application/json, text/plain, */*'});
+  const spans: NormSpan[] = [
+    {traceId: 'g', spanId: 'g-xhr', parentSpanId: '', name: 'GET', kind: 'CLIENT',
+      serviceName: 'petclinic-frontend', startNano: 1e9, attributes: {
+        'http.method': 'GET', 'http.url': 'http://127.0.0.1:8080/api/owners/1',
+        'genseq.request-headers': headers,
+      }},
+    {traceId: 'g', spanId: 'g-server', parentSpanId: 'g-xhr', name: 'GET /api/owners/{ownerId}',
+      kind: 'SERVER', serviceName: 'petclinic-backend', startNano: 1.1e9,
+      attributes: {'http.response.status_code': '200'}},
+  ];
+  const {puml, details} = renderDiagram('src/owners.spec.ts', [{title: 'x', traces: [spans]}]);
+  const entry = detailOn(lineWith(puml, 'Browser -> Backend:'), details.details);
+  expect(entry).toEqual({
+    title: 'Browser → Backend: GET /api/owners/{ownerId}',
+    steps: [{label: 'request',
+      text: 'GET http://127.0.0.1:8080/api/owners/1\nAccept: application/json, text/plain, */*'}],
+    request: {method: 'GET', url: 'http://127.0.0.1:8080/api/owners/1',
+      headers: {Accept: 'application/json, text/plain, */*'}},
+  });
+});
+
+test('a request’s body is the raw payload for a replay and pretty-printed for a reader', () => {
+  const {puml, details} = drawn({...CALL_SITE, 'http.method': 'POST',
+    'http.url': 'http://127.0.0.1:8080/api/visits', 'http.request.body': '{"a":1}'});
+  const entry = detailOn(lineWith(puml, 'Browser -> Backend:'), details.details) as any;
+  expect(entry.steps).toEqual([
+    {label: 'request', text: 'POST http://127.0.0.1:8080/api/visits\n\n{\n  "a": 1\n}'}]);
+  expect(entry.request).toEqual({method: 'POST', url: 'http://127.0.0.1:8080/api/visits', body: '{"a":1}'});
+});
+
+test('SEQ_HANDLER=call draws the controller as a call that everything the request did nests in', () => {
+  const {puml, details} = drawn(CALL_SITE, CALL);
+  const [id] = Object.keys(details.details);
+  const lines = puml.split('\n');
+  const at = lines.indexOf(`Browser -> Backend: [[genseq://${id}${REQUEST} POST /api/visits ⊕]]`);
+  expect(at).toBeGreaterThan(0);
+  expect(lines.slice(at + 1, at + 6)).toEqual([
+    'activate Backend',
+    `Backend -> Backend: [[${LANDED_ON} VisitController.addVisit ↗]]`,
+    'Backend --> Browser: 201',
+    'deactivate Backend',
+    'deactivate Browser',
+  ]);
+  expect(puml).not.toContain('→ VisitController');
+});
+
+// Any service's controller, and with the request's own work inside its activation — the
+// transaction a @Transactional controller opened included.
+test('the controller call nests the work of the request, on whichever service it landed', () => {
+  const span = (spanId: string, parentSpanId: string, name: string, kind: NormSpan['kind'],
+    serviceName: string, attributes: Record<string, string> = {}): NormSpan => ({
+    traceId: 'n', spanId, parentSpanId, name, kind, serviceName,
+    startNano: Number(spanId.slice(1)) * 1e6, attributes,
+  });
+  const spans = [
+    span('n1', '', 'POST /api/visits', 'SERVER', 'petclinic-backend', {'http.status_code': '201'}),
+    span('n2', 'n1', 'POST', 'CLIENT', 'petclinic-backend',
+      {'url.full': 'http://notification:8090/api/notifications/visit-booked'}),
+    span('n3', 'n2', 'POST /api/notifications/visit-booked', 'SERVER', 'notification-service',
+      {'http.response.status_code': '202', 'transaction.outcome': 'committed'}),
+    span('n4', 'n3', 'send-sms', 'INTERNAL', 'notification-service'),
+  ];
+  const handled = (s: NormSpan) => (s.spanId === 'n3'
+    ? {name: 'NotificationController.visitBooked', handle: 'src://n/C.java:9{Click}'} : undefined);
+  const {puml, details} = renderDiagram('x', [{title: 'x', traces: [spans]}], CALL,
+    new Map(), undefined, undefined, handled);
+  const lines = puml.split('\n');
+  const at = lines.findIndex((l) => l.startsWith('Backend -> NotificationService:'));
+  expect(lines.slice(at + 1, at + 9)).toEqual([
+    'activate NotificationService',
+    'NotificationService -> NotificationService: [[src://n/C.java:9{Click} '
+      + 'NotificationController.visitBooked ↗]]',
+    'activate NotificationService',
+    'group tx [committed]',
+    'NotificationService -> NotificationService: send-sms',
+    'end',
+    'deactivate NotificationService',
+    'NotificationService --> Backend: 202',
+  ]);
+  expect(lines[at + 9]).toBe('deactivate NotificationService');
+  expect(detailOn(lines[at], details.details).request!.url)
+    .toBe('http://notification:8090/api/notifications/visit-booked');
+});
+
+test('a controller call with nothing inside it is a bare arrow, no bar of its own', () => {
+  const spans: NormSpan[] = [
+    {traceId: 'e', spanId: 'e-test', parentSpanId: '', name: 'when', kind: 'INTERNAL',
+      serviceName: 'petclinic-backend', startNano: 1e9, attributes: {'genseq.participant': 'Test'}},
+    {traceId: 'e', spanId: 'e-server', parentSpanId: 'e-test', name: 'POST /api/visits',
+      kind: 'SERVER', serviceName: 'petclinic-backend', startNano: 1.1e9,
+      attributes: {'http.status_code': '201'}},
+  ];
+  const {puml} = renderDiagram('x', [{title: 'x', traces: [spans]}], CALL,
+    new Map(), undefined, undefined, controller);
+  expect(puml).toContain('activate Backend\n'
+    + `Backend -> Backend: [[${LANDED_ON} VisitController.addVisit \u2197]]\n`
+    + 'Backend --> Test: 201\ndeactivate Backend\n');
+  expect(puml.match(/^activate Backend$/gm)).toHaveLength(1);
+});
+
+test('a request whose controller is unknown has neither a third line nor a call', () => {
+  for (const options of [DEFAULT_DIAGRAM_OPTIONS, CALL]) {
+    const {puml} = renderDiagram('src/add-visit.spec.ts',
+      [{title: 'books a visit', traces: [browserRequest(CALL_SITE)]}],
+      options, new Map(), located, throughVisitService);
+    expect(puml).not.toContain('Backend -> Backend');
+    expect(lineWith(puml, 'Browser -> Backend:')).not.toContain('\\n[[');
+  }
+});
+
+test('a baked-in request has no panel, and names its controller only as a call', () => {
+  const panel = drawn(CALL_SITE, STATIC).puml;
+  expect(panel).toContain('Browser -> Backend: POST /api/visits\n');
+  expect(panel).not.toContain('genseq://');
+  expect(panel).not.toContain('VisitController');
+  const call = drawn(CALL_SITE, {...STATIC, handler: 'call'}).puml;
+  expect(call).toContain(`Browser -> Backend: POST /api/visits\nactivate Backend\n`
+    + `Backend -> Backend: [[${LANDED_ON} VisitController.addVisit ↗]]\n`);
+});
+
+// ── A driver call with no statement is not a query ───────────────────────────────
+// The JDBC instrumentation times every call into the driver, so borrowing or validating a
+// pooled connection arrives as a CLIENT span with the whole database semconv on it and
+// `db.statement` / `db.query.text` present but empty. Drawn, it is `Backend -> DB: petclinic`
+// — an arrow with nothing to say and nothing behind its ⊕.
+test('a DB span with an empty statement draws nothing at all', () => {
+  const connection: NormSpan = {
+    traceId: 'j', spanId: 'j-conn', parentSpanId: 'j-server', name: 'petclinic',
+    kind: 'CLIENT', serviceName: 'petclinic-backend', startNano: 1_100 * 1e6,
+    attributes: {
+      'db.system': 'postgresql', 'db.system.name': 'postgresql',
+      'db.name': 'petclinic', 'db.namespace': 'petclinic',
+      'db.connection_string': 'postgresql://localhost:5433',
+      'server.address': 'localhost', 'server.port': '5433',
+      'db.statement': '', 'db.query.text': '',
+    },
+  };
+  const server: NormSpan = {
+    traceId: 'j', spanId: 'j-server', parentSpanId: '', name: 'GET /api/owners',
+    kind: 'SERVER', serviceName: 'petclinic-backend', startNano: 1_000 * 1e6,
+    attributes: {'http.status_code': '200'},
+  };
+  const query: NormSpan = {
+    ...connection,
+    spanId: 'j-select', name: 'SELECT petclinic.owners', startNano: 1_200 * 1e6,
+    attributes: {...connection.attributes, 'db.statement': 'select o1_0.id from owners o1_0'},
+  };
+
+  const withoutStatement = renderPuml(
+    'src/owners.spec.ts', [{title: 'lists owners', traces: [[server, connection]]}], STATIC);
+  expect(withoutStatement).not.toContain('-> DB');
+  expect(withoutStatement).not.toContain('participant DB');
+  expect(withoutStatement).not.toContain('activate DB');
+
+  // the same span with a statement on it is the arrow it always was
+  const withStatement = renderPuml(
+    'src/owners.spec.ts', [{title: 'lists owners', traces: [[server, query]]}], STATIC);
+  expect(withStatement).toContain('participant DB');
+  expect(withStatement).toContain(
+    'Backend -> DB: select owners\\nSELECT o1_0.id\\nFROM owners o1_0');
+});
+
+// A lifeline that is a module, not a service, says so above its name. The guillemets go
+// into the display name, behind `as`: the review page's parsers read `participant X` and
+// `participant "…" as X`, and nothing after either.
+test('a lifeline declared with a stereotype names its kind above it', () => {
+  const span = (spanId: string, parentSpanId: string, name: string,
+    attributes: Record<string, string>): NormSpan => ({
+    traceId: 'm', spanId, parentSpanId, name, kind: parentSpanId ? 'INTERNAL' : 'SERVER',
+    serviceName: 'petclinic-backend', startNano: Number(spanId.slice(1)) * 1e6, attributes,
+  });
+  const spans = [
+    span('m1', '', 'POST /api/visits', {'http.status_code': '201'}),
+    span('m2', 'm1', 'PhoneNumbers.normalize',
+      {'genseq.participant': 'Commons', 'genseq.stereotype': 'module'}),
+    span('m3', 'm2', 'NotificationServiceClient.homeDialCode', {}),
+  ];
+  const puml = renderPuml('add-visit.spec.ts', [{title: 'x', traces: [spans]}], STATIC);
+
+  expect(puml).toContain('participant "«module»\\nCommons" as Commons');
+  expect(puml).toContain('participant Backend\n');
+  expect(puml).toContain('Backend -> Commons: PhoneNumbers.normalize');
+  expect(puml).toContain('Commons -> Backend: NotificationServiceClient.homeDialCode');
+});

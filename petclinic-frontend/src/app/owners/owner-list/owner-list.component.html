@@ -1,0 +1,49 @@
+<div class="container-fluid">
+  <div class="container xd-container">
+    <h2>Owners</h2>
+
+    <app-table-filter label="Search" (queryChange)="onSearchChange($event)"></app-table-filter>
+    <div *ngIf="errorMessage" class="alert alert-danger" role="alert">{{ errorMessage }}</div>
+    <div class="table-responsive" id="ownersTable"
+      *ngIf="owners">
+      <table class="table table-striped">
+        <thead>
+        <tr>
+          <th [attr.aria-sort]="sortColumn === 'name' ? sortDirection : 'none'"><button type="button" class="sort-header" data-sort="name" aria-label="Name" (click)="sortBy('name')">Name</button></th>
+          <th [attr.aria-sort]="sortColumn === 'address' ? sortDirection : 'none'"><button type="button" class="sort-header" data-sort="address" aria-label="Address" (click)="sortBy('address')">Address</button></th>
+          <th [attr.aria-sort]="sortColumn === 'city' ? sortDirection : 'none'"><button type="button" class="sort-header" data-sort="city" aria-label="City" (click)="sortBy('city')">City</button></th>
+          <th [attr.aria-sort]="sortColumn === 'telephone' ? sortDirection : 'none'"><button type="button" class="sort-header" data-sort="telephone" aria-label="Telephone" (click)="sortBy('telephone')">Telephone</button></th>
+          <th [attr.aria-sort]="sortColumn === 'pets' ? sortDirection : 'none'"><button type="button" class="sort-header" data-sort="pets" aria-label="Pets" (click)="sortBy('pets')">Pets</button></th>
+        </tr>
+        </thead>
+
+        <tbody>
+        <tr *ngFor="let owner of owners">
+          <td class="ownerFullName"><a routerLink="/owners/{{owner.id}}" routerLinkActive="active"
+            (click)="onSelect(owner)">{{ owner.firstName }} {{ owner.lastName }}</a></td>
+          <td>{{ owner.address }}</td>
+          <td>{{ owner.city }}</td>
+          <td>{{ owner.telephone }}</td>
+          <td>
+        <div *ngFor="let pet of owner.pets">
+          {{ pet.name }}
+        </div>
+        </td>
+        </tr>
+        </tbody>
+      </table>
+      <nav class="owners-pagination" aria-label="Owners pagination">
+        <label for="owners-page-size">Rows per page</label>
+        <app-combo inputId="owners-page-size" [options]="pageSizes" [ngModel]="pageSize"
+          (ngModelChange)="setPageSize($event)"></app-combo>
+        <span aria-live="polite">{{ firstRow() }}–{{ lastRow() }} of {{ total }}</span>
+        <button type="button" class="btn btn-default" (click)="previousPage()" [disabled]="pageIndex === 0">Previous</button>
+        <button type="button" class="btn btn-default" (click)="nextPage()"
+          [disabled]="lastRow() >= total">Next</button>
+      </nav>
+      <div>
+        <button *ngIf="isOwnersDataReceived" class="btn btn-default" (click)="addOwner()">Add Owner</button>
+      </div>
+    </div>
+  </div>
+</div>

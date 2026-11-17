@@ -1,0 +1,21 @@
+@startuml
+
+title Maven Module Graph
+
+skinparam shadowing false
+skinparam componentStyle rectangle
+skinparam nodesep 20
+skinparam ranksep 30
+
+component "notification-service" as notification_service
+component "petclinic-backend" as petclinic_backend
+component "petclinic-chatbot" as petclinic_chatbot
+component "petclinic-commons" as petclinic_commons
+component "petclinic-database" as petclinic_database
+component "refactoring-tools" as refactoring_tools
+
+notification_service --> petclinic_commons
+petclinic_backend --> petclinic_commons
+
+
+@enduml

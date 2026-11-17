@@ -1,0 +1,22 @@
+<app-table-filter #filter label="Filter visits" [hidden]="noVisits"></app-table-filter>
+<table [hidden]="noVisits" class=" table table-condensed">
+  <thead>
+  <tr>
+    <th>Visit Date</th>
+    <th>Description</th>
+    <th>Actions</th>
+  </tr>
+  </thead>
+  <tr *ngFor="let visit of visits | tableFilter: filter.query : ['date', 'description']">
+    <td>{{ visit.date }}</td>
+    <td>{{ visit.description }}</td>
+    <td>
+      <button class="btn btn-default" (click)="editVisit(visit)">Edit Visit</button>
+      <button class="btn btn-default" (click)="deleteVisit(visit)">Delete Visit</button>
+    </td>
+  </tr>
+</table>
+
+
+
+

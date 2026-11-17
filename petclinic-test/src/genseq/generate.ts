@@ -1,0 +1,639 @@
+import * as fs from 'fs';
+import * as path from 'path';
+import {readWindows} from '../support/trace-window-store';
+import {readCallSites} from '../support/call-sites';
+import {parseTempoTrace, renderDiagram, ClientMethods, Controllers, DiagramScenario, MethodLinks,
+  NormSpan, PARTICIPANT_ATTRIBUTE, TEST_PARTICIPANT} from './trace-to-puml';
+import {tempoConfigFromEnv, searchTraceIds, getTrace} from './tempo-client';
+import {DEFAULT_DIAGRAM_OPTIONS, DiagramOptions, describeOptions, optionsFromEnv} from './options';
+import {lineOfHandle, lineOfStep, lineOfTest, stepHandle, testHandle} from './test-location';
+import {methodHandle, overloadOf} from './code-location';
+import {CALL_SITE_ATTRIBUTE, CallFrame, CallSite, callSiteHandle, callSiteIndex, withCallSites}
+  from './call-site';
+import {Handler, WalkFiles, handlerOf, moduleHandlers} from './controller-location';
+import {clientMethodOf} from './client-method';
+import {defaultOperations} from './openapi-operations';
+
+export interface TestWindow {
+  title: string;
+  /** The file the scenario is written in — 'add-visit.spec.ts', 'owner-search.feature'. */
+  source: string;
+  startMs: number;
+  endMs: number;
+  /** Traced because GENSEQ_SELECT named it rather than for carrying the tag. */
+  selected?: boolean;
+}
+
+/** What a re-render needs: no Tempo, no clock — only somewhere to write and to log. */
+export interface RenderDeps {
+  writeFile: (filePath: string, content: string) => void;
+  /** Optional: lets a run merge into the span cache instead of replacing it. */
+  readFile?: (filePath: string) => string | undefined;
+  /** Optional: without it, re-rendering at a level with nothing to reveal leaves the
+   *  previous level's sidecar behind, claiming a detail the picture no longer offers. */
+  removeFile?: (filePath: string) => void;
+  /** Optional: what a directory holds, so a renamed or deleted scenario's diagram can be
+   *  swept rather than left on disk describing a run that no longer happens. */
+  listFiles?: (dir: string) => string[];
+  /** Optional: every file under a directory, so a request's route can be resolved against
+   *  the controllers of the service it reached. Without it no request names its controller. */
+  walkFiles?: WalkFiles;
+  log: (msg: string) => void;
+}
+
+export interface GenerateDeps extends RenderDeps {
+  searchTraceIds: (traceql: string, startMs: number, endMs: number) => Promise<string[]>;
+  getTrace: (traceId: string) => Promise<unknown>;
+  sleep?: (ms: number) => Promise<void>;
+  /** Optional: which line sent each request. Without it the request arrows carry no link. */
+  readCallSites?: () => CallSite[];
+}
+
+/** One source file's scenarios, as fetched from Tempo — the input a re-render replays. */
+export interface CachedSource {
+  source: string;
+  scenarios: DiagramScenario[];
+}
+
+// Tempo ingests asynchronously, so a search fired the instant the suite ends
+// routinely comes back empty for traces that land a second or two later.
+export interface RetryOptions {
+  attempts?: number;
+  delayMs?: number;
+}
+
+const DEFAULT_ATTEMPTS = 8;
+const DEFAULT_DELAY_MS = 2_000;
+
+export const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+export function slugify(title: string): string {
+  return title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+}
+
+async function searchWithRetry(
+  traceql: string, w: TestWindow, deps: GenerateDeps, retry: RetryOptions,
+): Promise<string[]> {
+  const attempts = retry.attempts ?? DEFAULT_ATTEMPTS;
+  const delayMs = retry.delayMs ?? DEFAULT_DELAY_MS;
+  const pause = deps.sleep ?? sleep;
+
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    const ids = await deps.searchTraceIds(traceql, w.startMs, w.endMs);
+    if (ids.length > 0) return ids;
+    if (attempt < attempts) await pause(delayMs);
+  }
+  return [];
+}
+
+/** `generated/` is created by the first run that draws into it, not kept by a .gitkeep. */
+function writeFileMakingDirs(filePath: string, content: string): void {
+  fs.mkdirSync(path.dirname(filePath), {recursive: true});
+  fs.writeFileSync(filePath, content);
+}
+
+/**
+ * The spans behind the last fetch, kept so a re-render needs nothing running.
+ * Tempo is queried once, when the tests run; every later `npm run diagram*` replays
+ * this file — which is what makes switching detail level a sub-second, offline switch.
+ */
+export function spanCachePathFor(rootDir: string): string {
+  return `${rootDir}/test-results/trace-spans.json`;
+}
+
+/**
+ * Where every generated picture lands: one directory, module-relative, holding both
+ * suites' output and nothing a human wrote.
+ *
+ * They used to sit next to their tests — `src/add-visit.spec.ts.<scenario>.genseq.puml`
+ * beside `src/add-visit.spec.ts`, and the Java ones inside `petclinic-backend/src/test`.
+ * That put generated files under two `src/` trees, where every reader, IDE search and
+ * "open the test folder" landed on four generated artifacts for each test actually
+ * written. `src/` is now only hand-written code, and everything a run produces is here,
+ * deletable in one command and regenerated by one.
+ *
+ * The diagrams stay *tracked* — that has not changed and is the whole point of them: a
+ * PR shows how a change moved the real browser→backend→DB flow.
+ */
+export const GENERATED_DIR = 'generated';
+
+/**
+ * A diagram is named after the test file and the *scenario* it draws:
+ * `add-visit.feature.remembers-the-vet.genseq.puml`.
+ *
+ * It used to be one file per test file, with the scenarios stacked inside it under
+ * `== header ==` dividers. That made the unit of the picture the class, which is not a
+ * unit anybody reviews: a reader looking for "remembers the vet" got four screens of
+ * arrows with the one they wanted somewhere in the middle, and the review page could
+ * offer no finer handle than the file. One scenario, one picture, one thing to open.
+ *
+ * The slug is the scenario's own title, which is what the reader is looking for and what
+ * the tags in the source say. It moves when the scenario is renamed — a rename then reads
+ * as a diagram deleted and another added, which is what a renamed test *is* to anyone
+ * reading the branch.
+ *
+ * Only the test's *base name* is kept: `source` can climb out of this module
+ * (`../petclinic-backend/src/test/java/…/AddVisitApiTest.java`), and a flat directory is
+ * the point — the path back to the test is carried inside the picture, as the `src://`
+ * handle on its title, not by where the file sits. `warnOnCollisions` covers the price of
+ * that flattening.
+ */
+export function diagramPathFor(rootDir: string, source: string, slug?: string): string {
+  return `${rootDir}/${GENERATED_DIR}/${path.basename(source)}${slug ? `.${slug}` : ''}.genseq.puml`;
+}
+
+/**
+ * What one diagram's markers reveal, beside it: `<test>.<scenario>.genseq.json`.
+ * A sidecar rather than comments inside the .puml — a payload is arbitrary text, and
+ * smuggling it through PlantUML's comment syntax is an escaping problem nobody needs.
+ */
+export function detailsPathFor(rootDir: string, source: string, slug?: string): string {
+  return `${rootDir}/${GENERATED_DIR}/${path.basename(source)}${slug ? `.${slug}` : ''}.genseq.json`;
+}
+
+/**
+ * One slug per scenario, all different.
+ *
+ * Two scenarios in a file can slugify the same way — "Add a visit" and "Add a visit!" —
+ * and two pictures writing to one path would leave the second silently standing in for
+ * both. Ties are numbered in the order the file declares them, so the numbering is stable
+ * as long as the file is.
+ */
+export function uniqueSlugs(titles: string[]): string[] {
+  const seen = new Map<string, number>();
+  return titles.map((title) => {
+    const base = slugify(title) || 'scenario';
+    const n = seen.get(base) ?? 0;
+    seen.set(base, n + 1);
+    return n === 0 ? base : `${base}-${n + 1}`;
+  });
+}
+
+/**
+ * Tempo returns a scenario's traces newest-first; a scenario is several traces (one
+ * per browser interaction) and the diagram's whole claim is that it shows the order
+ * they happened in. Spans are already sorted *within* a trace — this sorts the traces
+ * against each other, which is what made a POST render before the GET that preceded it.
+ *
+ * Ordered by the earliest *server* span, not by the earliest span of any kind: a
+ * browser root span opens when the interaction starts and stays open across the
+ * navigation that follows, so its start time can precede the request by a wide margin
+ * (measured: 146ms, enough to sort a POST ahead of two GETs that really came first).
+ * The backend spans all come from one JVM clock, which is the only clock here that can
+ * be compared across traces.
+ */
+function chronological(traces: NormSpan[][]): NormSpan[][] {
+  const startOf = (spans: NormSpan[]) => {
+    const serverSide = spans.filter((s) => s.serviceName !== 'petclinic-frontend');
+    // a trace with no server span at all (a lone click) can only be placed by its own clock
+    return Math.min(...(serverSide.length > 0 ? serverSide : spans).map((s) => s.startNano));
+  };
+  return [...traces].sort((a, b) => startOf(a) - startOf(b));
+}
+
+/** What the cache already holds, or nothing when it is absent, unreadable or not wired. */
+function readSpanCache(file: string, deps: GenerateDeps): CachedSource[] {
+  try {
+    const raw = deps.readFile?.(file);
+    return raw ? JSON.parse(raw) : [];
+  } catch {
+    return [];
+  }
+}
+
+/** `fresh` wins for the sources it covers; every other source keeps what it had. */
+export function mergeCachedSources(
+  cached: CachedSource[], fresh: CachedSource[],
+): CachedSource[] {
+  const replaced = new Set(fresh.map((c) => c.source));
+  return [...cached.filter((c) => !replaced.has(c.source)), ...fresh]
+    .sort((a, b) => a.source.localeCompare(b.source));
+}
+
+function groupBySource(windows: TestWindow[]): Map<string, TestWindow[]> {
+  const bySource = new Map<string, TestWindow[]>();
+  for (const w of windows) {
+    const group = bySource.get(w.source) ?? [];
+    group.push(w);
+    bySource.set(w.source, group);
+  }
+  return bySource;
+}
+
+export async function generateFromWindows(
+  windows: TestWindow[], rootDir: string, deps: GenerateDeps, retry: RetryOptions = {},
+  options: DiagramOptions = DEFAULT_DIAGRAM_OPTIONS,
+): Promise<string[]> {
+  const fetched: CachedSource[] = [];
+  const callSites = callSiteIndex(deps.readCallSites?.() ?? []);
+  // One diagram per source file, one section per scenario in it — so the picture
+  // is filed where its test is, and reads in the order the file does.
+  for (const [source, group] of groupBySource(windows)) {
+    const scenarios: DiagramScenario[] = [];
+    for (const w of group) {
+      // JSON.stringify, not interpolation: a scenario titled `Search for "Potter"`
+      // would otherwise close the TraceQL string early and Tempo would 400.
+      const traceql = `{ span.test.name = ${JSON.stringify(w.title)} }`;
+      try {
+        const ids = await searchWithRetry(traceql, w, deps, retry);
+        if (ids.length === 0) {
+          deps.log(`⏭️  "${w.title}": no traces in window — skipped`);
+          continue;
+        }
+        const traces: NormSpan[][] = [];
+        for (const id of ids) {
+          traces.push(withCallSites(parseTempoTrace(await deps.getTrace(id)), callSites));
+        }
+        scenarios.push({title: w.title, traces: chronological(traces),
+          ...(w.selected ? {selected: true} : {})});
+        deps.log(`✅ "${w.title}": ${ids.length} trace(s)${locatedRequests(traces)}`);
+      } catch (err) {
+        // One scenario's Tempo error must not cost every other diagram — the runner
+        // deletes them all up front, so an abort here leaves fewer on disk than it found.
+        deps.log(`⚠️  "${w.title}": ${(err as Error).message} — skipped`);
+      }
+    }
+    if (scenarios.length === 0) continue;
+    fetched.push({source, scenarios});
+  }
+
+  if (fetched.length > 0) {
+    // Merge, never replace. Each runner fetches only the sources it owns, so writing
+    // `fetched` over the cache left it holding whichever suite ran last — and a later
+    // `npm run diagram` then re-rendered *that* suite's diagrams and quietly none of the
+    // others. The same trap the windows store is built to avoid, in its sibling cache.
+    deps.writeFile(spanCachePathFor(rootDir),
+      JSON.stringify(mergeCachedSources(readSpanCache(spanCachePathFor(rootDir), deps), fetched)));
+  }
+  return renderScenarios(fetched, rootDir, deps, options);
+}
+
+/** Said out loud, because a request that lost its link does not show up any other way. */
+function locatedRequests(traces: NormSpan[][]): string {
+  const browser = traces.flat().filter(
+    (s) => s.kind === 'CLIENT' && s.serviceName === 'petclinic-frontend');
+  if (browser.length === 0) return '';
+  const located = browser.filter((s) => CALL_SITE_ATTRIBUTE in s.attributes);
+  return `, ${located.length}/${browser.length} browser request(s) traced to their line`;
+}
+
+/**
+ * Point every section header at the test that produced it.
+ *
+ * The lookup needs the source file, so a caller without `readFile` (the unit tests) gets
+ * plain headers rather than links into a file nobody could confirm exists — a link that
+ * lands nowhere costs the reviewer more than no link at all.
+ *
+ * `source` is relative to this module ('src/add-visit.spec.ts'); the handle has to be
+ * relative to the repo, which is what the review page resolves against.
+ */
+function linkScenarios(
+  scenarios: DiagramScenario[], rootDir: string, source: string, deps: RenderDeps,
+): DiagramScenario[] {
+  const text = deps.readFile?.(`${rootDir}/${source}`);
+  if (text === undefined) return scenarios;
+  return scenarios.map(
+    (s) => ({...s,
+      link: testHandle(repoRelative(rootDir, source), lineOfTest(text, s.title, source))}));
+}
+
+/**
+ * Point every self-call arrow at the method the span was opened on.
+ *
+ * The same bargain `linkScenarios` strikes just above: without `readFile` there is no
+ * working tree to confirm the class against, so the arrows keep their plain labels rather
+ * than carry links nobody checked.
+ *
+ * The handle has to be relative to the repo, and `rootDir` is the petclinic-test module
+ * inside it — hence the climb to its parent, which is where a backend class's
+ * `petclinic-backend/src/main/java/…` path is rooted.
+ */
+function methodLinksFor(rootDir: string, deps: RenderDeps, source: string): MethodLinks {
+  const readFile = deps.readFile;
+  if (!readFile) return () => undefined;
+  const repoRoot = path.dirname(rootDir);
+  const cache = new Map<string, string | undefined>();
+  return (span, scenario) => {
+    // A step arrow is the test talking about itself. `given("…")` is written in the test
+    // file and nowhere else, so there are no `code.*` attributes to follow — the sentence
+    // is looked up in the source instead, from the scenario's own declaration line so that
+    // two scenarios opening with the same words do not both point at the first one.
+    if (span.attributes[PARTICIPANT_ATTRIBUTE]?.trim() === TEST_PARTICIPANT) {
+      const text = readFile(`${rootDir}/${source}`);
+      if (text === undefined) return undefined;
+      return stepHandle(repoRelative(rootDir, source),
+        lineOfStep(text, span.name, lineOfHandle(scenario?.link)));
+    }
+    // A browser request knows the line that sent it, in this run: no lookup, only a check
+    // that this checkout still has that line.
+    const callSite = span.attributes[CALL_SITE_ATTRIBUTE];
+    if (callSite) return callSiteHandle(callSite, span.serviceName, repoRoot, readFile);
+    // One trace draws the same repository method many times over — an N+1 is exactly what
+    // these pictures are for — and each hit would otherwise re-read and re-scan the file.
+    // The overload is part of the key: `normalize(phone)` and `normalize(phone, country)`
+    // share a class and a name and live on different lines.
+    const key = [span.serviceName, span.attributes['code.namespace'],
+      span.attributes['code.function'], JSON.stringify(overloadOf(span.attributes))].join('#');
+    if (!cache.has(key)) {
+      cache.set(key, methodHandle(span.attributes, span.serviceName, repoRoot, readFile));
+    }
+    return cache.get(key);
+  };
+}
+
+/**
+ * Name the frontend method each browser request went through — see client-method.ts.
+ * Needs the working tree like the links above; without `readFile` the requests are drawn
+ * straight off the Browser lifeline, as they always were.
+ */
+function clientMethodsFor(rootDir: string, deps: RenderDeps): ClientMethods {
+  const readFile = deps.readFile;
+  if (!readFile) return () => undefined;
+  const repoRoot = path.dirname(rootDir);
+  const cache = new Map<string, string | undefined>();
+  return (span) => {
+    const attribute = span.attributes[CALL_SITE_ATTRIBUTE];
+    if (span.kind !== 'CLIENT' || !attribute) return undefined;
+    const key = `${span.spanId}#${attribute}`;
+    if (!cache.has(key)) {
+      let frames: CallFrame[] = [];
+      try {
+        frames = JSON.parse(attribute);
+      } catch {
+        // an unreadable attribute is a request with no known call site
+      }
+      const request = {
+        verb: span.attributes['http.method'] ?? span.attributes['http.request.method'],
+        url: span.attributes['http.url'] ?? span.attributes['url.full'],
+      };
+      cache.set(key, clientMethodOf(frames, request, `${repoRoot}/${span.serviceName}`, readFile));
+    }
+    return cache.get(key);
+  };
+}
+
+/**
+ * The controller method each request landed on — a method the trace never names, resolved by
+ * the SERVER span's route against that service's sources (controller-location.ts), scanned
+ * once per module. Needs the working tree and a way to walk it; without either, no request
+ * names its controller.
+ */
+function controllersFor(rootDir: string, deps: RenderDeps): Controllers {
+  const {readFile, walkFiles: walk} = deps;
+  if (!readFile || !walk) return () => undefined;
+  const repoRoot = path.dirname(rootDir);
+  const handlers = new Map<string, Map<string, Handler>>();
+  return (span) => {
+    if (span.kind !== 'SERVER') return undefined;
+    let routes = handlers.get(span.serviceName);
+    if (!routes) {
+      routes = moduleHandlers(span.serviceName, repoRoot, readFile, walk);
+      handlers.set(span.serviceName, routes);
+    }
+    return handlerOf(span, routes);
+  };
+}
+
+/** `source` resolved against the repo root — the path the review page can open. */
+function repoRelative(rootDir: string, source: string): string {
+  return path.normalize(path.join(path.basename(rootDir), source));
+}
+
+/**
+ * What the diagram calls itself. A Java source is filed next to its .java file, so its
+ * window's `source` climbs out of here as `../petclinic-backend/…` — a correct path and a
+ * useless heading, since `..` only means something to a reader who knows which directory
+ * the generator ran in. Those are named from the repo root; a source that stays inside
+ * petclinic-test keeps the module-relative name it has always had.
+ */
+function titleFor(rootDir: string, source: string): string {
+  return source.startsWith('..') ? repoRelative(rootDir, source) : source;
+}
+
+/** Every file under `dir`, absolute; nothing for a directory that is not there. */
+function walkFiles(dir: string): string[] {
+  if (!fs.existsSync(dir)) return [];
+  return fs.readdirSync(dir, {recursive: true, withFileTypes: true})
+    .filter((entry) => entry.isFile())
+    .map((entry) => path.join(entry.parentPath ?? (entry as any).path, entry.name));
+}
+
+/** Draw the diagrams from spans already in hand — the offline half of the pipeline. */
+export function renderScenarios(
+  sources: CachedSource[], rootDir: string, deps: RenderDeps,
+  options: DiagramOptions = DEFAULT_DIAGRAM_OPTIONS,
+): string[] {
+  const written: string[] = [];
+  warnOnCollisions(sources, deps);
+  const controllers = controllersFor(rootDir, deps);
+  for (const {source, scenarios} of sources) {
+    const linked = linkScenarios(scenarios, rootDir, source, deps);
+    const title = titleFor(rootDir, source);
+    const methodLinks = methodLinksFor(rootDir, deps, source);
+    const clientMethods = clientMethodsFor(rootDir, deps);
+    const slugs = uniqueSlugs(linked.map((s) => s.title));
+    const mine = new Set<string>();
+    linked.forEach((scenario, i) => {
+      const slug = slugs[i];
+      const filePath = diagramPathFor(rootDir, source, slug);
+      const detailsPath = detailsPathFor(rootDir, source, slug);
+      // One scenario per call, so the divider `renderDiagram` draws is this diagram's
+      // own header and the picture under it is one test from end to end.
+      const {puml, details} = renderDiagram(
+        title, [scenario], options, defaultOperations(), methodLinks, clientMethods, controllers);
+      // A scenario whose traces draw nothing — a lone click, a run that recorded no
+      // server span — used to cost a header inside a shared file and nothing more. On its
+      // own it would be a file containing a title and no conversation, which the review
+      // page would pair with the test and present as evidence. There is none.
+      if (!drewSomething(puml)) {
+        deps.log(`📭 ${source}: “${scenario.title}” drew nothing — no diagram`);
+        deps.removeFile?.(filePath);
+        deps.removeFile?.(detailsPath);
+        return;
+      }
+      mine.add(filePath);
+      mine.add(detailsPath);
+      deps.writeFile(filePath, puml);
+      deps.log(`📊 ${source}: “${scenario.title}” → ${filePath}`);
+      // Only the .puml paths are returned: the sidecar is part of one diagram, not
+      // another one, and every caller counts what it gets back as "diagrams".
+      written.push(filePath);
+      const revealed = Object.keys(details.details).length;
+      if (revealed > 0) {
+        deps.writeFile(detailsPath, `${JSON.stringify(details, null, 2)}\n`);
+        deps.log(`   🔍 ${revealed} revealable arrow(s) → ${detailsPath}`);
+      } else {
+        deps.removeFile?.(detailsPath);
+      }
+    });
+    sweepStale(rootDir, source, mine, deps);
+  }
+  return written;
+}
+
+/** Did this scenario draw a conversation, or only a heading?
+ *
+ * Asked of the participants, not of a `== divider ==`: a solo scenario is named by the
+ * title now and draws no divider at all. A lifeline is only declared when some trace
+ * actually emitted a line on it, so `participant` is the marker that survives both
+ * spellings — and it is the one that means what the question asks.
+ */
+function drewSomething(puml: string): boolean {
+  return /^participant /m.test(puml);
+}
+
+/**
+ * One flat directory pays for itself with one risk: two test files with the same base name
+ * in different folders draw into the same picture, and the second would stand in for both.
+ *
+ * Said out loud rather than worked around by re-introducing the source's directory into
+ * the name: a repo with two `AddVisitApiTest.java` wants renaming, and the alternative —
+ * a path smuggled into a file name — is what this move was getting rid of.
+ */
+function warnOnCollisions(sources: CachedSource[], deps: RenderDeps): void {
+  const owners = new Map<string, string[]>();
+  for (const {source} of sources) {
+    const name = path.basename(source);
+    owners.set(name, [...(owners.get(name) ?? []), source]);
+  }
+  for (const [name, claimants] of owners) {
+    if (claimants.length > 1) {
+      deps.log(`⚠️  ${claimants.join(' and ')} both draw into ${GENERATED_DIR}/${name}.*`
+        + ' — one overwrites the other; rename a test file');
+    }
+  }
+}
+
+/**
+ * Delete the diagrams of scenarios this file no longer has.
+ *
+ * With one file per test file there was nothing to sweep: the file was rewritten whole,
+ * so a deleted scenario simply stopped appearing in it. Per scenario, a rename or a
+ * deletion leaves the old picture on disk — committed, paired with the test by the review
+ * page, and describing a run that no longer exists. Needs `listFiles`; a caller without
+ * one (the unit tests) writes what it writes and sweeps nothing.
+ *
+ * Still swept per source file, by the name prefix, now that every suite writes into one
+ * directory: a run owns the pictures of the sources it drew and must not touch the other
+ * suite's, which are in the same folder and were not regenerated by this run.
+ */
+function sweepStale(
+  rootDir: string, source: string, mine: Set<string>, deps: RenderDeps,
+): void {
+  if (!deps.listFiles || !deps.removeFile) return;
+  const dir = path.resolve(`${rootDir}/${GENERATED_DIR}`);
+  const prefix = `${path.basename(source)}.`;
+  for (const name of deps.listFiles(dir)) {
+    if (!name.startsWith(prefix)) continue;
+    if (!name.endsWith('.genseq.puml') && !name.endsWith('.genseq.json')) continue;
+    const found = path.join(dir, name);
+    if (mine.has(found) || [...mine].some((m) => path.resolve(m) === found)) continue;
+    deps.removeFile(found);
+    deps.log(`🧹 removed ${found} — no scenario draws it any more`);
+  }
+}
+
+/**
+ * Which sources a run owns. A runner regenerates only its own diagrams — the windows
+ * file holds both suites' entries so that a standalone `npm run diagram` can re-render
+ * everything, and without this filter a plain `npm test` would rewrite the Cucumber
+ * diagrams from the *previous* Cucumber run's windows.
+ */
+export const PLAYWRIGHT_SOURCES = /\.spec\.ts$/;
+export const CUCUMBER_SOURCES = /\.feature$/;
+/** A @SpringBootTest carrying @GenerateSequence; its windows are written from the JVM. */
+export const JAVA_SOURCES = /\.java$/;
+
+// Maven cannot call runGenerate() with an argument the way the two Node runners do, so the
+// backend's run-tests-with-tracing.sh names its suite here instead. Without it a post-test
+// `npm run diagram` would take the no-owner path — replay the cache — and never go to
+// Tempo for the traces the Java run has just produced.
+const OWNED_SOURCES: Record<string, RegExp> = {
+  playwright: PLAYWRIGHT_SOURCES,
+  cucumber: CUCUMBER_SOURCES,
+  java: JAVA_SOURCES,
+};
+
+export function ownedSourcesFromEnv(
+  env: Record<string, string | undefined> = process.env,
+): RegExp | undefined {
+  return OWNED_SOURCES[env.GENSEQ_SUITE?.trim().toLowerCase() ?? ''];
+}
+
+export async function runGenerate(owned?: RegExp): Promise<void> {
+  const ownedSources = owned ?? ownedSourcesFromEnv();
+  const root = path.join(__dirname, '..', '..');
+  const windowsDir = path.join(root, 'test-results', 'trace-windows');
+  const options = optionsFromEnv();
+  console.log(`🎚️  Detail: ${describeOptions(options)}`);
+
+  // A standalone re-render (npm run diagram*) replays the cached spans: no Grafana,
+  // no backend, no test run — just the detail level you asked for. A test run always
+  // goes to Tempo instead (it owns fresh traces), and GENSEQ_REFRESH=1 forces that
+  // path by hand when the cache is stale.
+  const cacheFile = spanCachePathFor(root);
+  if (!ownedSources && !process.env.GENSEQ_REFRESH && fs.existsSync(cacheFile)) {
+    const cached: CachedSource[] = JSON.parse(fs.readFileSync(cacheFile, 'utf-8'));
+    const paths = renderScenarios(cached, root, {
+      writeFile: writeFileMakingDirs,
+      readFile: (p) => (fs.existsSync(p) ? fs.readFileSync(p, 'utf-8') : undefined),
+      removeFile: (p) => fs.rmSync(p, {force: true}),
+      listFiles: (d) => (fs.existsSync(d) ? fs.readdirSync(d) : []),
+      walkFiles,
+      log: (m) => console.log(m),
+    }, options);
+    console.log(`📊 Re-rendered ${paths.length} diagram(s) from ${cacheFile} — Grafana not needed`);
+    return;
+  }
+
+  if (!fs.existsSync(windowsDir)) {
+    console.warn(`ℹ️  ${windowsDir} not found — no diagrams generated.`);
+    return;
+  }
+
+  // Everything below is inside the guard: both hooks that call this document that it
+  // never throws, and a telemetry-only problem must never fail a whole suite.
+  try {
+    const all: TestWindow[] = readWindows(windowsDir);
+    const windows = ownedSources ? all.filter((w) => ownedSources.test(w.source ?? '')) : all;
+    if (windows.length === 0) {
+      console.log('ℹ️  No trace windows for this runner — no diagrams generated.');
+      return;
+    }
+
+    // TEMPO_URL is a bare Tempo (../start-tempo.sh, no Docker); otherwise GRAFANA_URL names
+    // whose Tempo this is: an isolated `start-docker.sh up --otel` instance prints its own
+    // under `ports`; unset, the dev stack's :3300.
+    const cfg = tempoConfigFromEnv();
+    console.log(`🔭 Tempo behind ${cfg.baseUrl}`);
+    const deps: GenerateDeps = {
+      searchTraceIds: (q, s, e) => searchTraceIds(cfg, q, s, e),
+      getTrace: (id) => getTrace(cfg, id),
+      readCallSites: () => readCallSites(path.join(root, 'test-results', 'call-sites')),
+      writeFile: writeFileMakingDirs,
+      readFile: (p) => (fs.existsSync(p) ? fs.readFileSync(p, 'utf-8') : undefined),
+      removeFile: (p) => fs.rmSync(p, {force: true}),
+      listFiles: (d) => (fs.existsSync(d) ? fs.readdirSync(d) : []),
+      walkFiles,
+      log: (m) => console.log(m),
+    };
+
+    // Each window deliberately ends a few seconds in the *future* (the pad that
+    // covers the exporters' async flush), so searching the moment the suite
+    // finishes would query a window that has not closed yet.
+    const settleMs = Math.max(...windows.map((w) => w.endMs)) - Date.now();
+    if (settleMs > 0) {
+      console.log(`⏳ Waiting ${(settleMs / 1000).toFixed(1)}s for the last trace window to close…`);
+      await sleep(settleMs);
+    }
+
+    const paths = await generateFromWindows(windows, root, deps, {}, options);
+    console.log(`📊 Generated ${paths.length} diagram(s)`);
+  } catch (err) {
+    console.warn(`⚠️  Diagram generation failed (continuing): ${(err as Error).message}`);
+  }
+}
+
+if (require.main === module) {
+  void runGenerate();
+}

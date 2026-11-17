@@ -1,0 +1,158 @@
+# petclinic-test — Claude Notes
+
+- Run all commands from this directory (`petclinic-test/`).
+- Backend: `localhost:8080`, frontend: `localhost:4200` — both must be up before `npm test`.
+  Other checkouts of this repo may own those ports: `./test-on-own-stack.sh npm test` runs
+  against HEAD's own containers instead (what `/human-review` does).
+- `@wip` scenarios state a rule the code does not enforce yet; `cucumber.js` skips them.
+- `npm run test:with-apps` auto-starts both apps, but is experimental; prefer starting apps manually.
+- Screenshots land in `test-results/screenshots/` (git-ignored, auto-generated).
+- `PW_VIDEO=on npm run test:cucumber` films each scenario into `test-results/cucumber-videos/`,
+  slowed down (`PW_SLOWMO`, default 400ms) and subtitled with its Gherkin steps plus a ✅/❌
+  verdict — a caption bar drawn *in the page* (`src/support/captions.ts`), because Homebrew's
+  ffmpeg has no drawtext/subtitles filter to burn one in afterwards.
+- Docker cleanup when things break: `docker-compose -f docker-compose.test.yml down -v`
+- Layout: `src/` holds the scenarios (`*.spec.ts` + `*.dsl.ts`, `*.feature` + `*.glue.ts`),
+  `src/support/` the fixtures/World, `src/genseq/` the Tempo→PlantUML tooling. Nothing generated
+  lives under `src/`: throwaway run output goes to `test-results/`, and the committed diagrams to
+  `generated/`.
+- ⚠️ `generated/*.genseq.puml` and their `generated/*.genseq.json` sidecars are **generated** but
+  tracked — one pair per tagged *scenario*, named `<test>.<scenario-slug>.genseq.puml`, for all
+  three suites (Playwright, Cucumber and the backend's `@GenerateSequence`). Never hand-edit:
+  change the test and re-run `./run-tests-with-tracing.sh`. Renaming a scenario renames its
+  diagram; the generator sweeps the old one. The path back to the test is *inside* the picture
+  (the `src://` handle on its title), not in the file's location.
+- `GENSEQ_SELECT` traces tests by name, untagged — `<file>::<title>` per line for the two browser
+  runners (`src/genseq/sequence-tag.ts`), `Class#method,…` (the `-Dtest` syntax) for the JVM,
+  where `-Pgenseq` autodetects `SequenceTraceExtension` on every test. `/human-review` fills it
+  with the tests a branch wrote (`human-review.json`, `steps.sequence.select`) and keeps what
+  they draw in `.human-review/`, so those pictures are never committed by a review.
+- A traced run on an isolated stack: `../start-docker.sh up --otel` gives the instance its own
+  Tempo, and `env $(../start-docker.sh ports <name>) ./run-tests-with-tracing.sh` points every
+  piece at it. Never hardcode :3300/:4318/:8080 in tracing code — read `GRAFANA_URL`,
+  `OTEL_EXPORTER_OTLP_ENDPOINT`, `BACKEND_URL`, keeping the dev port as the default. In a
+  container the browser's spans reach the collector only through the frontend's nginx
+  (`location = /v1/traces` → `lgtm:4318`), the same path `proxy.conf.js` serves under `ng serve`.
+- **Every test starts on the DB fixture it declares, and declaring nothing means empty** — the
+  schema plus the reference rows (pet types, specialties). A spec that reads rows it did not
+  write says so: `test.use({dbFixture: 'default'})` for the seed, or the name of a
+  `db/fixtures/<name>.sql`; a Cucumber feature or scenario tags itself `@fixture:default`.
+  The reset runs before **every** test (`src/support/db-fixture.ts`, through the docker
+  stack's `/__reset` sidecar), which is why the suite runs on **one worker**: a reset empties
+  the one database the stack shares. On `ng serve` there is no sidecar, and the tests run on
+  whatever the database holds, with a warning. The review page draws the declared fixture as
+  the test's dot; a test with no dot started empty.
+- A `Backend -> DB` arrow is labelled with **the call the query came from**, not the query —
+  `SELECT petclinic` (operation + *database*) is what all sixty queries of an N+1 are named.
+  `src/genseq/trace-to-puml.ts` takes the first of: Hibernate's own comment on the statement
+  (`hibernate.use_sql_comments` in the backend — real HQL, but only for an `@Query` method;
+  a derived method is built through the Criteria API and comments itself `<criteria>`), the
+  Spring Data repository method above it, the Hibernate session call above it, and finally
+  `select pets` / `insert into visits` read off the SQL — which is all a lazy load leaves
+  behind, since it carries no comment and sits under no repository span.
+  The statement itself lives behind the click; `src/genseq/sql-label.ts` folds it one clause
+  per line (`SELECT` / `FROM` / `JOIN` / `WHERE` / …), clipped to 10 words a line and 8 lines
+  an arrow, with the origin comment split off — it is Hibernate talking *about* the statement.
+- **A self-call on the leftmost lifeline is the test's own sentence**, not an instrumented
+  span: the Gherkin step of a `.feature`, the DSL function name of a `.spec.ts`, the
+  `given/when/then` of a `@SpringBootTest`. `src/genseq/steps.ts` records them (a timestamp per
+  sentence — the browser and the test run in two processes, so a span would have to be threaded
+  across); the renderer folds them between the traces. A sentence that caused no traffic is
+  **not** drawn, and a trace is placed by the browser's span **for that one request** — never by
+  the trace root, which opens on a click and stays open across everything that click leads to.
+- ⚠️ **`petclinic-frontend/src/otel.ts` must start tracing synchronously under an e2e run.**
+  `main.ts` imports it before bootstrapping Angular, so anything deferred to a promise misses the
+  app's bootstrap request — which is the *first* request of every scenario. It used to gate on an
+  async collector probe, so the opening navigation produced no trace and the diagram lost its
+  first sentence. The probe is kept for everyone else and skipped when `__E2E_TEST_NAME__` is
+  already on the page.
+- A `@SpringBootTest` annotated `@GenerateSequence` feeds the *same* pipeline: the JVM writes a
+  trace window into `test-results/trace-windows/` and `npm run diagram:java` (`GENSEQ_SUITE=java`)
+  fetches and renders it. `GENSEQ_SUITE` is how Maven names its suite — the two Node runners pass
+  a regex to `runGenerate()` directly, and with no owner the generator takes the replay-the-cache
+  path and never asks Tempo for the traces the Java run just produced. Its diagram is filed next
+  to the `.java` file, so its window's `source` climbs out of here as `../petclinic-backend/…`,
+  which the heading renders from the repo root instead — `..` means nothing to a reader who does
+  not know where the generator ran. There the sentences are real spans — one JVM, one OTel
+  context — and **`genseq.participant=Test` is what keeps the test off the app's lifeline**: it is
+  a contract with `petclinic-backend`'s `genseq/Steps.java`, and either half dropping it collapses
+  the whole picture onto `Backend`. Code:
+  `petclinic-backend/src/test/java/victor/training/petclinic/genseq/`, run with
+  `petclinic-backend/run-tests-with-tracing.sh` (needs only Tempo up).
+- **Any span can name its own lifeline**, not just a test's: `genseq.participant=<name>` is
+  read for whatever sets it. notification-service sets `SMS gateway` on its (fake) call out,
+  which is the only way a hop that never leaves a JVM can be drawn as a hop at all. The service
+  itself needs no attribute: `service.name=notification-service` maps to `NotificationService`
+  in `participantOf()`, beside `Backend` and `Browser`. A name that is not a bare
+  PlantUML identifier is wrapped in quotes by `pumlName()` — on the `participant` line and on
+  every arrow, activation and note — and **only** when it needs it: quoting `Backend` too would
+  repaint every committed diagram, which the review page diffs textually.
+- A `Browser -> Backend` arrow carries the **operation's name above its route**, read from the
+  repo's `openapi.yaml` by `src/genseq/openapi-operations.ts` (a `summary` where the API has
+  one, else the `operationId`). The route says where a call went; the name says what it was for.
+- **A repository call is drawn as a call**: a self-hop, an activation, and its statements
+  fired from inside it — the shape a reader expects of a method that queries, and what
+  gives the transaction frame somewhere to sit.
+- **A transaction is drawn as a `group tx` frame, not an arrow.** The interceptor's
+  `Transaction.commit` is emitted as the last child of whatever opened the transaction, so
+  the renderer frames that span's whole subtree and drops the commit arrow — the frame's
+  closing edge *is* the commit. A bare `Transaction.commit` arrow said a transaction ended
+  somewhere above and left the reader to guess how far up. The frame also shows what is
+  **outside** every transaction, which is the whole story of an N+1 behind
+  open-session-in-view: in this codebase nothing above the repositories is `@Transactional`,
+  so each repository call is its own transaction and its own Hibernate session, and the lazy
+  loads that follow run in none of them. A query inside a frame does not repeat the frame's
+  label — it falls back to describing itself (`select pets`).
+  It is called just `tx`: the frame shows an *extent*, and whatever opened it is named by
+  the call the frame sits inside. Where the interceptor opens it decides what the frame
+  wraps, and all three placements are covered — on a **repository** or a **service** it sits
+  inside that call's activation; on the **handler** (`@Transactional` on a controller
+  method) the commit lands on the SERVER span, so the frame wraps the handler's *body*.
+  Framing the span itself would swallow the request and response arrows with it, and the
+  picture would lose the call it is about.
+- **How a transaction ended is written beside its tab**: `group tx [committed]` in grey,
+  `[rolled back]` / `[commit failed]` in amber (PlantUML draws a group's `[…]` tail to the
+  right of the tab). The agent records no rollback at all, so the backend's
+  `TransactionOutcomeTracing` (a Spring `TransactionExecutionListener`) stamps
+  `transaction.outcome` on the span that opened the transaction; a trace without it falls back
+  to the commit span, i.e. `committed`.
+- The **`Session.*` / `Hibernate Query` spans are dropped** when a Spring Data repository span
+  above them already said the same thing. They are kept with no repository above them — code
+  using the EntityManager directly, where the session call is the only account of the request.
+- Activation bars are drawn **only around a call that encloses something**. A leaf hop (a DB
+  query, a childless `@WithSpan`) gets a bare arrow — the box would enclose nothing and each
+  `activate`/`deactivate` pair costs vertical space the N+1-heavy diagrams cannot spare.
+- **Detail is a render-time switch, not a capture-time one.** The traces always carry
+  everything (SQL + bound values from the agent, HTTP payloads from the browser); `SEQ_SQL`
+  (`off`|`statement`|`values`) and `SEQ_HTTP_BODIES` (`0`|`1`) decide what is drawn —
+  `src/genseq/options.ts`. So re-rendering is **~1s and needs nothing running** — not even
+  Grafana: the fetched spans are cached in `test-results/trace-spans.json` and replayed
+  (`GENSEQ_REFRESH=1` forces a fresh Tempo fetch). No test run, no backend, no browser: `npm run diagram:lean` / `diagram` / `diagram:full`, or the two env
+  vars with `npm run trace:diagram`. This note is the only place that says so: a generated
+  file's footer carries the "do not edit" warning and nothing else, because a reader of the
+  *image* cannot act on a list of npm scripts and it crowded out the diagram.
+- **A diagram is interactive by default** (`SEQ_INTERACTIVE=1`): the picture stays simplified
+  and each revealable arrow's **whole label** is wrapped in `[[genseq://<id>{…} <label>]]`, a
+  PlantUML link that becomes an `<a href>` in the SVG — the hook
+  `.claude/skills/human-review/scripts/build-review-html.py` binds to, so nothing ever matches
+  rendered label text. (It used to be a trailing `⊕`: a second, smaller thing to aim at when
+  the reviewer already wants to click the arrow.) One click reveals, another closes; a DB
+  panel **toggles** between `?` and the bound values, carried as the step's `alternate`.
+  That was a second click before, which swapped the text under the reader and counted itself
+  `1 / 2` — advertising neither that it existed nor what it would do. `SEQ_INTERACTIVE=0`
+  bakes the detail back into the picture, which is what `diagram:lean`/`:static`/`:full` do. The ids are **hashes of the detail, never counters** — `.claude/skills/human-review/scripts/puml-diff.sh` diffs the
+  `.puml` textually, so a positional id would repaint everything under an inserted query.
+- **A `Browser -> Backend` arrow links to the line that sent that request**, taken from the
+  request's own JS stack, never from a search (README, "A browser request links…"). It needs no
+  application change and no extra build: `src/support/call-sites.ts` wraps XHR and fetch from
+  outside, and the source maps of the `docker` build are served beside the bundles even though
+  they are `hidden`. Both fixtures record it for traced tests only. An arrow without a link is
+  the honest answer, so do not add a fallback: `npm run trace:diagram` logs
+  `n/m browser request(s) traced to their line` per test.
+- The windows file (`test-results/trace-windows.json`) is what a standalone re-render replays,
+  so each runner forgets only **its own** entries at start (`*.spec.ts` for Playwright,
+  `*.feature` for Cucumber) — wiping it whole would shrink re-renders to the last suite that ran.
+- HTTP payloads are captured in `petclinic-frontend/src/otel.ts` (`http.request.body` /
+  `http.response.body` on the XHR client span, 4 KB cap) — no OTel agent records payloads, and
+  the browser is the only place both sides are in hand. The renderer therefore reads them off
+  the span **or its parent**, since the arrow is drawn from the backend's SERVER span.

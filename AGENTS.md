@@ -46,12 +46,13 @@ npm run test:arch        # imports adhere to docs/frontend-packages.puml
 
 ## Architecture
 
-Backend layering, the database, the REST contract, the domain model and Java code style are
-scoped to [petclinic-backend/AGENTS.md](petclinic-backend/AGENTS.md) — it auto-loads only for
-conversations rooted there. Before changing how the layers, the database or the notification
-call work, read the decisions and their reasons in [ARCHITECTURE.md](ARCHITECTURE.md). When a
-guardrail test fails, or a living diagram no longer matches the code, the drift checks and what
-each of them asserts are described in [GUARDRAILS.md](GUARDRAILS.md).
+Backend layering, the database, the REST contract and the domain model are scoped to
+[petclinic-backend/AGENTS.md](petclinic-backend/AGENTS.md) — it auto-loads only for conversations
+rooted there. Java code style is in the [java-code-style skill](.claude/skills/java-code-style/SKILL.md).
+Before changing how the layers, the database or the notification call work, read the decisions
+and their reasons in [ARCHITECTURE.md](ARCHITECTURE.md). When a guardrail test fails, or a living
+diagram no longer matches the code, the drift checks and what each of them asserts are described
+in [GUARDRAILS.md](GUARDRAILS.md).
 
 ## Additional Knowledge
 
@@ -105,4 +106,3 @@ which is a different and much cheaper thing: proxy URLs, no runner render, no pu
 - Challenge my prompts - I love hearing I'm wrong! Be a thinking partener, not a sycophantic yes-man.
 - Before any git commit, make sure to update any drifted knowledge in AGENTS.md, keeping it under 200 lines: move details into separate docs that AGENTS.md links to (progressive disclosure)
 - An AI-made commit ends with `Co-Authored-By: Claude <Model> (effort: <level>, context: <window>)`, e.g. `Co-Authored-By: Claude Opus 5.5 (effort: high, context: 1M)` — no `<noreply@anthropic.com>`
-

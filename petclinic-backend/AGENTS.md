@@ -56,6 +56,3 @@ Core entities and relationships:
 - **Pet** 1→N **Visit**
 - **Vet** N→N **Specialty** (via `vet_specialties` join table)
 - **User** 1→N **Role**
-
-## Java Code Style
-Enforced by the [`java-rule`](../.claude/rules/java-rule.md) — auto-loaded on every `.java` edit, not just a soft-matched skill.

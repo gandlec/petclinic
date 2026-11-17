@@ -111,7 +111,8 @@ public class OwnerRestController {
         matching.sort(ownerComparator(sort, direction));
 
         long start = (long) page * size;
-        List<OwnerDto> items = start >= matching.size() ? List.of()
+        List<OwnerDto> items = start >= matching.size()
+                ? List.of()
                 : ownerMapper.toOwnerDtoCollection(matching.subList((int) start,
                         (int) Math.min(start + size, matching.size())));
         return new OwnerPageDto(items, matching.size());
@@ -127,7 +128,8 @@ public class OwnerRestController {
 
     private List<Owner> matchingOwners(String search) {
         List<Owner> owners = ownerRepository.findAll();
-        List<Owner> matching = search.isBlank() ? owners
+        List<Owner> matching = search.isBlank()
+                ? owners
                 : owners.stream().filter(owner -> matchesSearch(owner, search)).toList();
         return new ArrayList<>(matching);
     }

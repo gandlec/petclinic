@@ -308,8 +308,8 @@ public class OwnerTest {
 
     private List<String> ownerNames(JsonNode page) {
         List<String> names = new java.util.ArrayList<>();
-        page.path("items").forEach(owner ->
-                names.add(owner.path("firstName").asText() + " " + owner.path("lastName").asText()));
+        page.path("items")
+                .forEach(owner -> names.add(owner.path("firstName").asText() + " " + owner.path("lastName").asText()));
         return names;
     }
 

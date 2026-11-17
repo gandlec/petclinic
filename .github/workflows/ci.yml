@@ -22,6 +22,9 @@ jobs:
     # Branch pushes already cover same-repo PRs; only run the pull_request
     # event for forks (whose push events we never see).
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
+    env:
+      # Exposed here so the Sonar steps can skip themselves (`if:` cannot read secrets directly)
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -235,12 +238,14 @@ jobs:
           git push
 
       - name: SonarCloud Scan
+        if: env.SONAR_TOKEN != ''
         uses: SonarSource/sonarqube-scan-action@v8
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: SonarCloud Quality Gate check
+        if: env.SONAR_TOKEN != ''
         uses: SonarSource/sonarqube-quality-gate-action@v1
         timeout-minutes: 5
         env:
